@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import os
+import ntpath
 import sys
 import time
 from dataclasses import dataclass, field
@@ -186,14 +186,27 @@ def display_simulate(
     brightness_scale: float,
     target_kelvin: int,
     timeout: float,
+    augmentation_mode: str | None = None,
+    crop_enabled: bool | None = None,
+    crop_ratio: str | None = None,
+    crop_mode: str | None = None,
 ) -> None:
     url = _join(display_base, "/simulate")
+    body: dict[str, Any] = {
+        "brightness_scale": brightness_scale,
+        "target_kelvin": target_kelvin,
+    }
+    if augmentation_mode is not None:
+        body["augmentation_mode"] = augmentation_mode
+    if crop_enabled is not None:
+        body["crop_enabled"] = crop_enabled
+    if crop_ratio is not None:
+        body["crop_ratio"] = crop_ratio
+    if crop_mode is not None:
+        body["crop_mode"] = crop_mode
     payload = http_post_json(
         url,
-        {
-            "brightness_scale": brightness_scale,
-            "target_kelvin": target_kelvin,
-        },
+        body,
         timeout=timeout,
     )
     ensure_ok(payload, "display simulate")
@@ -234,6 +247,20 @@ def display_load(
     url = _join(display_base, "/load")
     payload = http_post_json(url, {"path": path}, timeout=timeout)
     ensure_ok(payload, "display load")
+
+
+def display_load_black(
+    display_base: str,
+    duration_sec: float,
+    timeout: float,
+) -> None:
+    url = _join(display_base, "/load-black")
+    payload = http_post_json(
+        url,
+        {"duration_sec": duration_sec},
+        timeout=timeout,
+    )
+    ensure_ok(payload, "display load-black")
 
 
 def capture_trigger(
@@ -339,15 +366,13 @@ def download_captured_files(
     pulled: list[Path] = []
 
     for full in files_found:
-        name = os.path.basename(full)
+        # Capture server may run on Windows and report paths like C:\dir\file.bmp.
+        # ntpath.basename handles both "\" and "/" separators on any client OS.
+        name = ntpath.basename(full)
         if not name:
             continue
 
-        stem = Path(name).stem
-        if not stem:
-            continue
-
-        out_path = output_dir / stem
+        out_path = output_dir / name
         if out_path.exists() and not overwrite:
             pulled.append(out_path)
             continue
@@ -466,6 +491,46 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="delay after /simulate before capture (seconds)",
     )
+    p.add_argument(
+        "--augmentation-mode",
+        choices=("mpv_filters", "scripted_hdr"),
+        default=None,
+        help=(
+            "display augmentation mode for /simulate. "
+            "By default, keep current server mode."
+        ),
+    )
+    p.add_argument(
+        "--crop-enabled",
+        dest="crop_enabled",
+        action="store_true",
+        help="enable fixed-ratio center crop in scripted_hdr mode",
+    )
+    p.add_argument(
+        "--crop-disabled",
+        dest="crop_enabled",
+        action="store_false",
+        help="disable scripted_hdr crop",
+    )
+    p.set_defaults(crop_enabled=None)
+    p.add_argument(
+        "--crop-ratio",
+        default="16:9",
+        help=(
+            "crop ratio used when crop is enabled (default: 16:9). "
+            "Accepts values like 16:9 or 1.77778."
+        ),
+    )
+    p.add_argument(
+        "--crop-mode",
+        choices=("crop", "reflect_pad"),
+        default=None,
+        help=(
+            "scripted_hdr ratio handling when crop is enabled: "
+            "'crop' center-crops, 'reflect_pad' keeps full image via "
+            "reflective padding. By default, keep current server mode."
+        ),
+    )
 
     p.add_argument(
         "--delay-before-load",
@@ -492,6 +557,59 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="delay after capture completes (seconds)",
+    )
+    p.add_argument(
+        "--oled-black-break",
+        dest="oled_black_break",
+        action="store_true",
+        default=True,
+        help=(
+            "show a black image periodically to reduce OLED retention risk "
+            "(default: enabled)"
+        ),
+    )
+    p.add_argument(
+        "--no-oled-black-break",
+        dest="oled_black_break",
+        action="store_false",
+        help="disable periodic OLED black-image breaks",
+    )
+    p.add_argument(
+        "--oled-black-every-n-images",
+        type=int,
+        default=60,
+        help="show a black break every N images (default: 60)",
+    )
+    p.add_argument(
+        "--oled-black-duration-sec",
+        type=float,
+        default=600.0,
+        help="length of each black break in seconds (default: 600)",
+    )
+    p.add_argument(
+        "--final-black-screen",
+        dest="final_black_screen",
+        action="store_true",
+        default=True,
+        help=(
+            "show a black image after the experiment finishes "
+            "(default: enabled)"
+        ),
+    )
+    p.add_argument(
+        "--no-final-black-screen",
+        dest="final_black_screen",
+        action="store_false",
+        help="do not show a black image at the end of the experiment",
+    )
+    p.add_argument(
+        "--final-black-duration-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "duration_sec argument passed to display /load-black at the end "
+            "(default: 0)"
+        ),
     )
 
     p.add_argument(
@@ -578,6 +696,12 @@ def main() -> int:
         raise SystemExit("--k-captures must be >= 1")
     if args.capture_retries < 0:
         raise SystemExit("--capture-retries must be >= 0")
+    if args.oled_black_every_n_images < 1:
+        raise SystemExit("--oled-black-every-n-images must be >= 1")
+    if args.oled_black_duration_sec < 0:
+        raise SystemExit("--oled-black-duration-sec must be >= 0")
+    if args.final_black_duration_sec < 0:
+        raise SystemExit("--final-black-duration-sec must be >= 0")
 
     b_vals = linspace(
         float(args.brightness_scale_min),
@@ -622,6 +746,27 @@ def main() -> int:
     )
 
     for img_idx, img in enumerate(images, start=1):
+        should_take_black_break = (
+            bool(args.oled_black_break)
+            and img_idx > 1
+            and (img_idx - 1) % int(args.oled_black_every_n_images) == 0
+        )
+        if should_take_black_break:
+            timed_step(
+                step_log,
+                "display_load_black",
+                lambda: display_load_black(
+                    args.display,
+                    duration_sec=float(args.oled_black_duration_sec),
+                    timeout=args.http_timeout,
+                ),
+            )
+            timed_step(
+                step_log,
+                "oled_black_break_delay",
+                lambda: _sleep(float(args.oled_black_duration_sec)),
+            )
+
         timed_step(
             step_log,
             "delay_before_load",
@@ -656,6 +801,10 @@ def main() -> int:
                     brightness_scale=brightness_scale,
                     target_kelvin=target_kelvin,
                     timeout=args.http_timeout,
+                    augmentation_mode=args.augmentation_mode,
+                    crop_enabled=args.crop_enabled,
+                    crop_ratio=args.crop_ratio if args.crop_enabled is True else None,
+                    crop_mode=args.crop_mode if args.crop_enabled is True else None,
                 ),
                 request_id=request_id,
                 image=img,
@@ -735,6 +884,17 @@ def main() -> int:
                 brightness_scale=brightness_scale,
                 target_kelvin=target_kelvin,
             )
+
+    if bool(args.final_black_screen):
+        timed_step(
+            step_log,
+            "final_display_load_black",
+            lambda: display_load_black(
+                args.display,
+                duration_sec=float(args.final_black_duration_sec),
+                timeout=args.http_timeout,
+            ),
+        )
 
     return 0
 

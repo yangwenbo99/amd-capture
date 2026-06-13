@@ -170,3 +170,31 @@ python3 control/control_capture_session.py \
   --crop-ratio 16:9 \
     --crop-mode reflect_pad \
 ```
+
+
+```bash
+python3 control/control_capture_session.py \
+  --display http://localhost:8080 \
+  --capture http://192.168.0.101:48765 \
+  --k-captures 3 \
+  --brightness-scale-min 0.70 \
+  --brightness-scale-max 1.20 \
+  --kelvin-min 3500 \
+  --kelvin-max 7500 \
+  --image-list ~/Documents/camera-projection/flist.txt \
+  --delay-before-capture 10.0 \
+  --download-dir re-captures-202606 \
+  --retry-delay-sec 10 \
+  --step-log re-captures-202606/steps.tsv \
+  --augmentation-mode scripted_hdr \
+  --crop-enabled \
+  --crop-ratio 16:9 \
+    --crop-mode reflect_pad \
+```
+
+To turn off the TV:
+```bash
+adb connect 192.168.0.227:5555
+adb shell input keyevent 26       # Pressing the power button
+
+```

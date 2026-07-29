@@ -198,3 +198,27 @@ adb connect 192.168.0.227:5555
 adb shell input keyevent 26       # Pressing the power button
 
 ```
+
+
+## Alignment
+
+1. Reproduce geometry transform
+    ```python
+    python misc_scripts/apply_geometry_transform.py \
+        --input-dir ~/Downloads/WQI-people-4k-people-llama-llama-sim/people-4k-people-llama-llama-sim/ \
+        --output-dir ~/Downloads/WQI-people-4k-people-llama-llama-sim/people-4k-people-llama-llama-sim-padded \
+      --crop-enabled \
+      --crop-ratio 16:9 \
+        --crop-mode reflect_pad \
+        --output-ext .png \
+        --png-bit-depth 8
+    ```
+2. Finding coarse alignment
+    ```python
+python3 alignment/align_quad.py \
+  --reference '/home/yang/pc07/pc07home/Downloads/WQI-people-4k-people-llama-llama-sim/people-4k-people-llama-llama-sim-padded/0000000-032.png' \
+  --captured  '/home/yang/pc07/pc07home/Documents/Arya/captures-download-wm-batch-1-backlight/cap-0001-001_0000000-032.bmp' \
+
+    ```
+
+

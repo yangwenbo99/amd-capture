@@ -5,6 +5,10 @@
     - `download.py`: Download from the server to the local machine
 - `display/`
     - `mpv_driver.py`: Control the TV (in HDR mode) to display videos
+- `control/`
+    - `control_capture_session.py`: the main script to control the whole capture session
+    - `control_display_interface.py`: direct interaction with the MPV driver
+    - `control_organize_results.py`: organize the captured images
 - `calculation/`: scripts for calculation certain properties
     - `color_temp.py`: calculate the conversion multiplier between two colour temperature 
         - AI written, but is probably right. 
@@ -68,7 +72,8 @@ python download_all_files.py \
 
 ## TODOs
 
-- Hardware setup instructions
+- Write hardware setup instructions
+- Rewrite the server code so that the capturing directory is cleared before each capture, and the results for each captured will be downloaded to the control machine immediately.
 
 ## misc_scripts
 

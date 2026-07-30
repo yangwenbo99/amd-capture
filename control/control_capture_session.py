@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import ntpath
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import urljoin
 
 import requests
@@ -78,12 +79,14 @@ def append_step_log(path: Path | None, entry: StepLog) -> None:
     if path is None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
+    extra_json = json.dumps(entry.extra, sort_keys=True) if entry.extra else ""
     line = (
         f"{entry.ts_start_iso}\t{entry.ts_end_iso}\t"
         f"{entry.duration_sec:.3f}\t{entry.step}\t"
         f"{entry.ok}\t{entry.request_id or ''}\t"
         f"{entry.image or ''}\t{entry.brightness_scale or ''}\t"
-        f"{entry.target_kelvin or ''}\t{entry.error or ''}\n"
+        f"{entry.target_kelvin or ''}\t{entry.error or ''}\t"
+        f"{extra_json}\n"
     )
     with open(path, "a", encoding="utf-8") as f:
         f.write(line)
@@ -99,12 +102,19 @@ def timed_step(
     brightness_scale: float | None = None,
     target_kelvin: int | None = None,
     extra: dict[str, Any] | None = None,
+    extra_from_result: Callable[[Any], dict[str, Any]] | None = None,
 ):
     t0 = time.time()
     ts0 = now_iso()
     try:
         result = fn()
         ts1 = now_iso()
+        merged_extra: dict[str, Any] = dict(extra or {})
+        if extra_from_result is not None:
+            try:
+                merged_extra.update(extra_from_result(result) or {})
+            except Exception:
+                pass
         append_step_log(
             log_path,
             StepLog(
@@ -117,7 +127,7 @@ def timed_step(
                 brightness_scale=brightness_scale,
                 target_kelvin=target_kelvin,
                 ok=True,
-                extra=extra or {},
+                extra=merged_extra,
             ),
         )
         return result
@@ -263,6 +273,59 @@ def display_load_black(
     ensure_ok(payload, "display load-black")
 
 
+def try_load_black_after_crash(
+    display_base: str,
+    duration_sec: float,
+    timeout: float,
+) -> None:
+    try:
+        display_load_black(
+            display_base=display_base,
+            duration_sec=duration_sec,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        print(
+            f"warning: failed to issue crash load-black: {exc}",
+            file=sys.stderr,
+        )
+
+
+def capture_server_is_busy(
+    capture_base: str,
+    timeout: float,
+) -> bool:
+    """
+    Return True if the capture server reports busy=True, False otherwise.
+    Errors talking to /health are treated as "unknown" -> False, so the
+    caller falls back to its normal retry logic.
+    """
+    try:
+        payload = http_get_json(_join(capture_base, "/health"), timeout=timeout)
+    except Exception:
+        return False
+    return bool(payload.get("busy", False))
+
+
+def wait_until_capture_server_idle(
+    capture_base: str,
+    timeout: float,
+    max_wait_sec: float,
+    poll_interval_sec: float = 1.0,
+) -> bool:
+    """
+    Poll /health until busy is False or max_wait_sec elapses.
+    Returns True if the server became idle, False on timeout.
+    """
+    deadline = time.monotonic() + max(0.0, float(max_wait_sec))
+    while True:
+        if not capture_server_is_busy(capture_base, timeout=timeout):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        _sleep(float(poll_interval_sec))
+
+
 def capture_trigger(
     capture_base: str,
     token: str | None,
@@ -318,6 +381,21 @@ def capture_with_retries(
     retries: int,
     retry_delay_sec: float,
 ) -> dict[str, Any]:
+    # Bound on how long we'll wait for the server to leave "busy" state on a
+    # 409. Use the per-capture timeout if known, otherwise a generous default,
+    # plus some slack to cover post-click file waiting on the server.
+    busy_max_wait_sec = float(capture_timeout_sec) + 30.0 if capture_timeout_sec else 120.0
+    # 409 responses don't consume a retry slot, but cap them to avoid infinite
+    # loops if something is truly wedged on the server.
+    max_busy_retries = 5
+    busy_retries = 0
+
+    # 5xx responses also don't consume a normal retry slot: server-side errors
+    # are usually transient and worth a few extra attempts even if the user
+    # configured a small --capture-retries.
+    max_server_error_retries = 5
+    server_error_retries = 0
+
     attempts = 0
     last_exc: Exception | None = None
     while attempts <= retries:
@@ -341,6 +419,58 @@ def capture_with_retries(
                 attempts += 1
                 continue
             raise
+        except requests.HTTPError as exc:
+            last_exc = exc
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 409:
+                # Server reports a capture is already in progress. This usually
+                # means a previous request is still running server-side after
+                # the client timed out. Wait until /health reports idle, then
+                # retry without consuming a normal retry slot.
+                print(
+                    f"warning: capture server returned 409 (busy); "
+                    f"waiting up to {busy_max_wait_sec:.1f}s for it to become idle",
+                    file=sys.stderr,
+                )
+                became_idle = wait_until_capture_server_idle(
+                    capture_base=capture_base,
+                    timeout=timeout,
+                    max_wait_sec=busy_max_wait_sec,
+                )
+                if not became_idle:
+                    print(
+                        "warning: capture server still busy after wait; "
+                        "falling back to normal retry backoff",
+                        file=sys.stderr,
+                    )
+                    _sleep(float(retry_delay_sec))
+                busy_retries += 1
+                if busy_retries >= max_busy_retries:
+                    raise RuntimeError(
+                        f"capture server stayed busy across "
+                        f"{busy_retries} 409 responses; giving up"
+                    ) from exc
+                continue
+            if status is not None and 500 <= status < 600:
+                server_error_retries += 1
+                if server_error_retries >= max_server_error_retries:
+                    raise RuntimeError(
+                        f"capture server returned {status} across "
+                        f"{server_error_retries} attempts; giving up"
+                    ) from exc
+                print(
+                    f"warning: capture server returned {status}; "
+                    f"retrying after {retry_delay_sec:.1f}s "
+                    f"(server-error retry "
+                    f"{server_error_retries}/{max_server_error_retries})",
+                    file=sys.stderr,
+                )
+                _sleep(float(retry_delay_sec))
+                continue
+            if attempts >= retries:
+                raise
+            _sleep(float(retry_delay_sec))
+            attempts += 1
         except requests.RequestException as exc:
             last_exc = exc
             if attempts >= retries:
@@ -553,6 +683,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--extra-delay-after-load-black",
+        type=float,
+        default=40.0,
+        help=(
+            "extra delay before display load/simulate when the previous "
+            "display operation was /load-black (seconds)"
+        ),
+    )
+    p.add_argument(
         "--delay-after-capture",
         type=float,
         default=0.0,
@@ -643,7 +782,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--capture-retries",
         type=int,
-        default=2,
+        default=5,
         help="retry capture on timeout/error this many times",
     )
     p.add_argument(
@@ -685,218 +824,293 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    images = parse_images(args)
-
-    download_dir = Path(args.download_dir) if args.download_dir else None
-    step_log = Path(args.step_log) if args.step_log else None
-    if step_log is None and download_dir is not None:
-        step_log = download_dir / "steps.tsv"
-
-    if args.k_captures < 1:
-        raise SystemExit("--k-captures must be >= 1")
-    if args.capture_retries < 0:
-        raise SystemExit("--capture-retries must be >= 0")
-    if args.oled_black_every_n_images < 1:
-        raise SystemExit("--oled-black-every-n-images must be >= 1")
-    if args.oled_black_duration_sec < 0:
-        raise SystemExit("--oled-black-duration-sec must be >= 0")
-    if args.final_black_duration_sec < 0:
-        raise SystemExit("--final-black-duration-sec must be >= 0")
-
-    b_vals = linspace(
-        float(args.brightness_scale_min),
-        float(args.brightness_scale_max),
-        int(args.k_captures),
-    )
-    k_vals_f = linspace(
-        float(args.kelvin_min),
-        float(args.kelvin_max),
-        int(args.k_captures),
-    )
-    k_vals = [int(round(x)) for x in k_vals_f]
-
-    # Quick connectivity checks (fail fast with readable errors).
     try:
+        images = parse_images(args)
+
+        download_dir = Path(args.download_dir) if args.download_dir else None
+        step_log = Path(args.step_log) if args.step_log else None
+        if step_log is None and download_dir is not None:
+            step_log = download_dir / "steps.tsv"
+
+        if args.k_captures < 1:
+            raise SystemExit("--k-captures must be >= 1")
+        if args.capture_retries < 0:
+            raise SystemExit("--capture-retries must be >= 0")
+        if args.oled_black_every_n_images < 1:
+            raise SystemExit("--oled-black-every-n-images must be >= 1")
+        if args.oled_black_duration_sec < 0:
+            raise SystemExit("--oled-black-duration-sec must be >= 0")
+        if args.final_black_duration_sec < 0:
+            raise SystemExit("--final-black-duration-sec must be >= 0")
+
+        b_vals = linspace(
+            float(args.brightness_scale_min),
+            float(args.brightness_scale_max),
+            int(args.k_captures),
+        )
+        k_vals_f = linspace(
+            float(args.kelvin_min),
+            float(args.kelvin_max),
+            int(args.k_captures),
+        )
+        k_vals = [int(round(x)) for x in k_vals_f]
+
+        # Quick connectivity checks (fail fast with readable errors).
+        try:
+            timed_step(
+                step_log,
+                "display_ping",
+                lambda: ensure_ok(
+                    http_get_json(_join(args.display, "/ping"), args.http_timeout),
+                    "display ping",
+                ),
+            )
+        except Exception:
+            # Older versions may not have /ping; fall back to /status.
+            timed_step(
+                step_log,
+                "display_status",
+                lambda: ensure_ok(
+                    http_get_json(_join(args.display, "/status"), args.http_timeout),
+                    "display status",
+                ),
+            )
+
         timed_step(
             step_log,
-            "display_ping",
+            "capture_health",
             lambda: ensure_ok(
-                http_get_json(_join(args.display, "/ping"), args.http_timeout),
-                "display ping",
+                http_get_json(_join(args.capture, "/health"), args.http_timeout),
+                "capture health",
             ),
         )
-    except Exception:
-        # Older versions may not have /ping; fall back to /status.
-        timed_step(
-            step_log,
-            "display_status",
-            lambda: ensure_ok(
-                http_get_json(_join(args.display, "/status"), args.http_timeout),
-                "display status",
-            ),
-        )
 
-    timed_step(
-        step_log,
-        "capture_health",
-        lambda: ensure_ok(
-            http_get_json(_join(args.capture, "/health"), args.http_timeout),
-            "capture health",
-        ),
-    )
+        last_display_operation: str | None = None
+        pending_extra_delay_before_simulate = False
 
-    for img_idx, img in enumerate(images, start=1):
-        should_take_black_break = (
-            bool(args.oled_black_break)
-            and img_idx > 1
-            and (img_idx - 1) % int(args.oled_black_every_n_images) == 0
-        )
-        if should_take_black_break:
-            timed_step(
-                step_log,
-                "display_load_black",
-                lambda: display_load_black(
-                    args.display,
-                    duration_sec=float(args.oled_black_duration_sec),
-                    timeout=args.http_timeout,
-                ),
+        for img_idx, img in enumerate(images, start=1):
+            should_take_black_break = (
+                bool(args.oled_black_break)
+                and img_idx > 1
+                and (img_idx - 1) % int(args.oled_black_every_n_images) == 0
             )
-            timed_step(
-                step_log,
-                "oled_black_break_delay",
-                lambda: _sleep(float(args.oled_black_duration_sec)),
-            )
-
-        timed_step(
-            step_log,
-            "delay_before_load",
-            lambda: _sleep(float(args.delay_before_load)),
-            image=img,
-        )
-        timed_step(
-            step_log,
-            "display_load",
-            lambda: display_load(args.display, img, timeout=args.http_timeout),
-            image=img,
-        )
-        timed_step(
-            step_log,
-            "delay_after_load",
-            lambda: _sleep(float(args.delay_after_load)),
-            image=img,
-        )
-
-        for sweep_idx in range(int(args.k_captures)):
-            request_id = (
-                f"{args.request_id_prefix}-{img_idx:04d}-{sweep_idx:03d}"
-            )
-            brightness_scale = float(b_vals[sweep_idx])
-            target_kelvin = int(k_vals[sweep_idx])
-
-            timed_step(
-                step_log,
-                "display_simulate",
-                lambda: display_simulate(
-                    args.display,
-                    brightness_scale=brightness_scale,
-                    target_kelvin=target_kelvin,
-                    timeout=args.http_timeout,
-                    augmentation_mode=args.augmentation_mode,
-                    crop_enabled=args.crop_enabled,
-                    crop_ratio=args.crop_ratio if args.crop_enabled is True else None,
-                    crop_mode=args.crop_mode if args.crop_enabled is True else None,
-                ),
-                request_id=request_id,
-                image=img,
-                brightness_scale=brightness_scale,
-                target_kelvin=target_kelvin,
-            )
-            timed_step(
-                step_log,
-                "delay_after_simulate",
-                lambda: _sleep(float(args.delay_after_simulate)),
-                request_id=request_id,
-                image=img,
-                brightness_scale=brightness_scale,
-                target_kelvin=target_kelvin,
-            )
-
-            timed_step(
-                step_log,
-                "delay_before_capture",
-                lambda: _sleep(float(args.delay_before_capture)),
-                request_id=request_id,
-                image=img,
-                brightness_scale=brightness_scale,
-                target_kelvin=target_kelvin,
-            )
-            cap = timed_step(
-                step_log,
-                "capture",
-                lambda: capture_with_retries(
-                    capture_base=args.capture,
-                    token=args.token,
-                    request_id=request_id,
-                    timeout=args.http_timeout,
-                    expected_glob=args.expected_glob,
-                    expected_count=args.expected_count,
-                    watch_folder=args.watch_folder,
-                    capture_timeout_sec=args.capture_timeout_sec,
-                    retries=int(args.capture_retries),
-                    retry_delay_sec=float(args.retry_delay_sec),
-                ),
-                request_id=request_id,
-                image=img,
-                brightness_scale=brightness_scale,
-                target_kelvin=target_kelvin,
-            )
-
-            files_found = cap.get("files_found", [])
-            if not isinstance(files_found, list):
-                raise RuntimeError(f"Malformed capture response: {cap}")
-
-            if download_dir is not None and files_found:
+            if should_take_black_break:
                 timed_step(
                     step_log,
-                    "download",
-                    lambda: download_captured_files(
-                        capture_base=args.capture,
-                        token=args.token,
-                        watch_folder=args.watch_folder,
-                        files_found=files_found,
-                        output_dir=download_dir,
+                    "display_load_black",
+                    lambda: display_load_black(
+                        args.display,
+                        duration_sec=float(args.oled_black_duration_sec),
                         timeout=args.http_timeout,
-                        overwrite=bool(args.overwrite),
+                    ),
+                )
+                last_display_operation = "load-black"
+                timed_step(
+                    step_log,
+                    "oled_black_break_delay",
+                    lambda: _sleep(float(args.oled_black_duration_sec)),
+                )
+
+            timed_step(
+                step_log,
+                "delay_before_load",
+                lambda: _sleep(float(args.delay_before_load)),
+                image=img,
+            )
+            should_extra_delay_before_load = last_display_operation == "load-black"
+            if should_extra_delay_before_load:
+                timed_step(
+                    step_log,
+                    "extra_delay_after_load_black_before_load",
+                    lambda: _sleep(float(args.extra_delay_after_load_black)),
+                    image=img,
+                )
+                pending_extra_delay_before_simulate = True
+            timed_step(
+                step_log,
+                "display_load",
+                lambda: display_load(args.display, img, timeout=args.http_timeout),
+                image=img,
+            )
+            last_display_operation = "load"
+            timed_step(
+                step_log,
+                "delay_after_load",
+                lambda: _sleep(float(args.delay_after_load)),
+                image=img,
+            )
+
+            for sweep_idx in range(int(args.k_captures)):
+                request_id = (
+                    f"{args.request_id_prefix}-{img_idx:04d}-{sweep_idx:03d}"
+                )
+                brightness_scale = float(b_vals[sweep_idx])
+                target_kelvin = int(k_vals[sweep_idx])
+
+                if pending_extra_delay_before_simulate:
+                    timed_step(
+                        step_log,
+                        "extra_delay_after_load_black_before_simulate",
+                        lambda: _sleep(float(args.extra_delay_after_load_black)),
+                        request_id=request_id,
+                        image=img,
+                        brightness_scale=brightness_scale,
+                        target_kelvin=target_kelvin,
+                    )
+                    pending_extra_delay_before_simulate = False
+                timed_step(
+                    step_log,
+                    "display_simulate",
+                    lambda: display_simulate(
+                        args.display,
+                        brightness_scale=brightness_scale,
+                        target_kelvin=target_kelvin,
+                        timeout=args.http_timeout,
+                        augmentation_mode=args.augmentation_mode,
+                        crop_enabled=args.crop_enabled,
+                        crop_ratio=args.crop_ratio if args.crop_enabled is True else None,
+                        crop_mode=args.crop_mode if args.crop_enabled is True else None,
                     ),
                     request_id=request_id,
                     image=img,
                     brightness_scale=brightness_scale,
                     target_kelvin=target_kelvin,
-                    extra={"files_found_count": len(files_found)},
+                )
+                last_display_operation = "simulate"
+                timed_step(
+                    step_log,
+                    "delay_after_simulate",
+                    lambda: _sleep(float(args.delay_after_simulate)),
+                    request_id=request_id,
+                    image=img,
+                    brightness_scale=brightness_scale,
+                    target_kelvin=target_kelvin,
                 )
 
+                timed_step(
+                    step_log,
+                    "delay_before_capture",
+                    lambda: _sleep(float(args.delay_before_capture)),
+                    request_id=request_id,
+                    image=img,
+                    brightness_scale=brightness_scale,
+                    target_kelvin=target_kelvin,
+                )
+                download_retries_left = int(args.capture_retries)
+                while True:
+                    cap = timed_step(
+                        step_log,
+                        "capture",
+                        lambda: capture_with_retries(
+                            capture_base=args.capture,
+                            token=args.token,
+                            request_id=request_id,
+                            timeout=args.http_timeout,
+                            expected_glob=args.expected_glob,
+                            expected_count=args.expected_count,
+                            watch_folder=args.watch_folder,
+                            capture_timeout_sec=args.capture_timeout_sec,
+                            retries=int(args.capture_retries),
+                            retry_delay_sec=float(args.retry_delay_sec),
+                        ),
+                        request_id=request_id,
+                        image=img,
+                        brightness_scale=brightness_scale,
+                        target_kelvin=target_kelvin,
+                        extra_from_result=lambda r: {
+                            "capture_filenames": [
+                                ntpath.basename(p)
+                                for p in (r.get("files_found") or [])
+                                if isinstance(p, str) and p
+                            ]
+                        },
+                    )
+
+                    files_found = cap.get("files_found", [])
+                    if not isinstance(files_found, list):
+                        raise RuntimeError(f"Malformed capture response: {cap}")
+
+                    if download_dir is None or not files_found:
+                        break
+
+                    try:
+                        timed_step(
+                            step_log,
+                            "download",
+                            lambda: download_captured_files(
+                                capture_base=args.capture,
+                                token=args.token,
+                                watch_folder=args.watch_folder,
+                                files_found=files_found,
+                                output_dir=download_dir,
+                                timeout=args.http_timeout,
+                                overwrite=bool(args.overwrite),
+                            ),
+                            request_id=request_id,
+                            image=img,
+                            brightness_scale=brightness_scale,
+                            target_kelvin=target_kelvin,
+                            extra={"files_found_count": len(files_found)},
+                        )
+                        break
+                    except (
+                        requests.exceptions.ChunkedEncodingError,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.HTTPError,
+                    ) as exc:
+                        if isinstance(exc, requests.exceptions.HTTPError):
+                            status = (
+                                exc.response.status_code
+                                if exc.response is not None
+                                else None
+                            )
+                            if status != 404 and not (
+                                status is not None and 500 <= status < 600
+                            ):
+                                raise
+                        if download_retries_left <= 0:
+                            raise
+                        download_retries_left -= 1
+                        print(
+                            f"warning: download failed ({exc}); "
+                            f"treating capture as failed and redoing "
+                            f"(retries left: {download_retries_left})",
+                            file=sys.stderr,
+                        )
+                        _sleep(float(args.retry_delay_sec))
+
+                timed_step(
+                    step_log,
+                    "delay_after_capture",
+                    lambda: _sleep(float(args.delay_after_capture)),
+                    request_id=request_id,
+                    image=img,
+                    brightness_scale=brightness_scale,
+                    target_kelvin=target_kelvin,
+                )
+
+        if bool(args.final_black_screen):
             timed_step(
                 step_log,
-                "delay_after_capture",
-                lambda: _sleep(float(args.delay_after_capture)),
-                request_id=request_id,
-                image=img,
-                brightness_scale=brightness_scale,
-                target_kelvin=target_kelvin,
+                "final_display_load_black",
+                lambda: display_load_black(
+                    args.display,
+                    duration_sec=float(args.final_black_duration_sec),
+                    timeout=args.http_timeout,
+                ),
             )
+            last_display_operation = "load-black"
 
-    if bool(args.final_black_screen):
-        timed_step(
-            step_log,
-            "final_display_load_black",
-            lambda: display_load_black(
-                args.display,
-                duration_sec=float(args.final_black_duration_sec),
-                timeout=args.http_timeout,
-            ),
+        return 0
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except Exception:
+        try_load_black_after_crash(
+            display_base=args.display,
+            duration_sec=float(args.final_black_duration_sec),
+            timeout=float(args.http_timeout),
         )
-
-    return 0
+        raise
 
 
 if __name__ == "__main__":

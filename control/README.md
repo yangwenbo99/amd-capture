@@ -5,6 +5,10 @@
 - an mpv display server (from `display/mpv_driver.py`)
 - a Windows capture server (from `server/server_main.py`)
 
+For direct display-only endpoint calls, use:
+
+- `control_display_interface.py` (thin wrapper around display server HTTP API)
+
 It loads one image at a time on the display side, waits configurable delays
 (especially **"show → capture"**), triggers capture, and optionally downloads
 every captured file to a local directory.
@@ -22,6 +26,24 @@ python3 control/control_capture_session.py \
   --image "set1/img002.exr" \
   --delay-before-capture 1.2 \
   --download-dir captures
+```
+
+Call display endpoints individually:
+
+```bash
+python3 control/control_display_interface.py \
+  --display http://192.168.1.2:8080 status
+
+python3 control/control_display_interface.py \
+  --display http://192.168.1.2:8080 load --path set1/img001.exr
+
+python3 control/control_display_interface.py \
+  --display http://192.168.1.2:8080 simulate \
+  --brightness-scale 1.05 \
+  --target-kelvin 6100 \
+  --augmentation-mode scripted_hdr \
+  --crop-enabled \
+  --crop-ratio 16:9
 ```
 
 Sweep settings \(k captures per image\) over brightness and Kelvin ranges:

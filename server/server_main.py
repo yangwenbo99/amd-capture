@@ -80,6 +80,16 @@ BUTTON_CONTROL_TYPE = "Button"
 PRE_CLICK_DELAY_SEC = 0.1
 POST_CLICK_DELAY_SEC = 0.1
 
+# Maximum time to wait for a single click attempt (click_input/invoke/mouse.click)
+# to return before we abandon it and try the next strategy. pywinauto's click
+# methods drive real Win32 input and have no built-in timeout, so they can hang
+# indefinitely if the desktop is locked, the input queue is stuck, or the target
+# window's UI thread is unresponsive.
+CLICK_ATTEMPT_TIMEOUT_SEC = 5.0
+# Maximum time to wait for window focus operations (set_focus / minimize /
+# maximize) to return. These can also hang on an unresponsive UI thread.
+FOCUS_ATTEMPT_TIMEOUT_SEC = 5.0
+
 API_TOKEN = None  # e.g. "my-lan-secret"
 
 LOG_LEVEL = logging.INFO
@@ -387,21 +397,89 @@ def resolve_button(window):
 
 
 
+class _ClickTimeoutError(RuntimeError):
+    """Raised when a click/focus attempt exceeds its allotted timeout."""
+
+
+def run_with_timeout(
+    func,
+    timeout_sec: float,
+    description: str,
+):
+    """
+    Run ``func()`` in a daemon thread and wait up to ``timeout_sec`` seconds.
+
+    Returns the function's return value on success.
+    Re-raises any exception the function raised.
+    Raises ``_ClickTimeoutError`` if the call did not return in time.
+
+    Note: when a timeout occurs, the worker thread is *abandoned*, not killed,
+    because Python cannot safely interrupt a thread blocked in a Win32 call.
+    The thread is daemonic so it will not prevent process exit. If clicks hang
+    repeatedly, the leaked threads accumulate and the server should be
+    restarted.
+    """
+    result: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = func()
+        except BaseException as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    thread = threading.Thread(
+        target=_runner,
+        name=f"click-attempt:{description}",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=timeout_sec)
+
+    if thread.is_alive():
+        raise _ClickTimeoutError(
+            f"{description} did not complete within {timeout_sec:.1f}s "
+            f"(thread abandoned)"
+        )
+
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
 def perform_capture_click() -> None:
     _, window = connect_to_window()
 
     logger.info("Connected to target window.")
 
     # For UIA backend, restore() is not always reliable, so ignore failures.
+    # Each focus call is wrapped with a timeout because set_focus / minimize /
+    # maximize can hang on an unresponsive UI thread.
     try:
-        window.set_focus()
-    except Exception:
+        run_with_timeout(
+            window.set_focus,
+            timeout_sec=FOCUS_ATTEMPT_TIMEOUT_SEC,
+            description="window.set_focus()",
+        )
+    except Exception as first_focus_exc:
+        logger.warning("Initial set_focus failed: %r", first_focus_exc)
         try:
-            window.minimize()
+            run_with_timeout(
+                window.minimize,
+                timeout_sec=FOCUS_ATTEMPT_TIMEOUT_SEC,
+                description="window.minimize()",
+            )
             time.sleep(0.2)
-            window.maximize()
+            run_with_timeout(
+                window.maximize,
+                timeout_sec=FOCUS_ATTEMPT_TIMEOUT_SEC,
+                description="window.maximize()",
+            )
             time.sleep(0.3)
-            window.set_focus()
+            run_with_timeout(
+                window.set_focus,
+                timeout_sec=FOCUS_ATTEMPT_TIMEOUT_SEC,
+                description="window.set_focus() (retry)",
+            )
         except Exception as exc:
             raise RuntimeError(f"Unable to focus target window: {exc}") from exc
 
@@ -434,12 +512,22 @@ def perform_capture_click() -> None:
     except Exception:
         logger.info("Button resolved, but failed to read debug properties.")
 
+    # Each click attempt below is wrapped in run_with_timeout because pywinauto's
+    # click methods can hang indefinitely on an unresponsive desktop / UI thread.
+    # On timeout we log and fall through to the next strategy.
+
     # Attempt 1: normal click_input()
     try:
-        button.click_input()
+        run_with_timeout(
+            button.click_input,
+            timeout_sec=CLICK_ATTEMPT_TIMEOUT_SEC,
+            description="button.click_input()",
+        )
         logger.info("Capture button clicked with click_input().")
         time.sleep(POST_CLICK_DELAY_SEC)
         return
+    except _ClickTimeoutError as exc:
+        logger.error("click_input() hung: %s", exc)
     except Exception as exc:
         logger.warning("click_input() failed: %r", exc)
 
@@ -448,10 +536,16 @@ def perform_capture_click() -> None:
         method = getattr(button, method_name, None)
         if callable(method):
             try:
-                method()
+                run_with_timeout(
+                    method,
+                    timeout_sec=CLICK_ATTEMPT_TIMEOUT_SEC,
+                    description=f"button.{method_name}()",
+                )
                 logger.info("Capture button activated with %s().", method_name)
                 time.sleep(POST_CLICK_DELAY_SEC)
                 return
+            except _ClickTimeoutError as exc:
+                logger.error("%s() hung: %s", method_name, exc)
             except Exception as exc:
                 logger.warning("%s() failed: %r", method_name, exc)
 
@@ -461,10 +555,18 @@ def perform_capture_click() -> None:
         if rect.width() <= 0 or rect.height() <= 0:
             raise RuntimeError("Button rectangle is empty.")
         center = rect.mid_point()
-        mouse.click(coords=(center.x, center.y))
+        run_with_timeout(
+            lambda: mouse.click(coords=(center.x, center.y)),
+            timeout_sec=CLICK_ATTEMPT_TIMEOUT_SEC,
+            description=f"mouse.click(({center.x},{center.y}))",
+        )
         logger.info("Capture button clicked by screen coordinates at (%d, %d).", center.x, center.y)
         time.sleep(POST_CLICK_DELAY_SEC)
         return
+    except _ClickTimeoutError as exc:
+        raise RuntimeError(
+            f"All button click methods failed; last attempt timed out: {exc}"
+        ) from exc
     except Exception as exc:
         raise RuntimeError(f"All button click methods failed. Last error: {exc}") from exc
 
@@ -535,6 +637,7 @@ def run_capture(
         if ok
         else f"Timed out waiting for {expected_count} new file(s) matching {expected_glob}."
     )
+    logger.info("message")
 
     resp = CaptureResponse(
         ok=ok,

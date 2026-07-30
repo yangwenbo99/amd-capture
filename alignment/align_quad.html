@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QuadAlign — reference/captured alignment</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px; background: #16181c; color: #d6d9de;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  #toolbar {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 6px 10px; background: #23262d;
+    border-bottom: 1px solid #34383f; flex-shrink: 0;
+  }
+  #toolbar .sep { width: 1px; height: 18px; background: #3a3e46; margin: 0 4px; }
+  #toolbar .brand { color: #5bc0ff; font-weight: bold; letter-spacing: .5px; }
+  #toolbar label { color: #9aa0a8; }
+  #main { display: flex; flex: 1; overflow: hidden; }
+  #viewport {
+    flex: 1; position: relative; overflow: hidden;
+    background: #0e0f12; cursor: grab; touch-action: none;
+  }
+  #viewport.panning { cursor: grabbing; }
+  #scene { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+  #ref-img { display: block; max-width: none; user-select: none; -webkit-user-drag: none; }
+  #cap-img {
+    position: absolute; top: 0; left: 0; transform-origin: 0 0;
+    max-width: none; pointer-events: none; user-select: none; -webkit-user-drag: none;
+  }
+  #overlay { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
+  #sidebar {
+    width: 290px; flex-shrink: 0; background: #1c1f25;
+    border-left: 1px solid #34383f; overflow-y: auto;
+    padding: 12px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .section-title {
+    font-size: 10px; color: #7d838c; text-transform: uppercase;
+    letter-spacing: 1px; margin-bottom: 6px;
+  }
+  .btn {
+    background: #363a42; border: 1px solid #4a4f58; color: #d6d9de;
+    padding: 4px 9px; cursor: pointer; border-radius: 3px;
+    font-family: inherit; font-size: 11px;
+  }
+  .btn:hover { background: #424751; }
+  .btn.active { background: #5bc0ff; color: #0e0f12; border-color: #5bc0ff; }
+  select, input[type=number] {
+    background: #2a2e35; border: 1px solid #454a53; color: #e4e7ec;
+    padding: 3px 5px; font-family: inherit; font-size: 11px; border-radius: 3px;
+  }
+  input[type=range] { width: 90px; accent-color: #5bc0ff; vertical-align: middle; }
+  .vgrid {
+    display: grid; grid-template-columns: 34px 1fr 1fr; gap: 5px;
+    align-items: center;
+  }
+  .vgrid .head { font-size: 10px; color: #7d838c; text-align: center; }
+  .vgrid label {
+    font-weight: bold; padding: 2px 4px; border-radius: 3px; text-align: center;
+  }
+  .vgrid input { width: 100%; }
+  .vrow.selected label { outline: 2px solid #fff; }
+  .vrow.selected input { border-color: #5bc0ff; }
+  #rel-coords, #img-info { font-size: 10.5px; color: #9aa0a8; line-height: 1.7; }
+  #rel-coords .k { color: #5bc0ff; }
+  .hint { font-size: 10px; color: #6b7079; line-height: 1.65; }
+  .hint b { color: #9aa0a8; font-weight: 600; }
+  #status { font-size: 11px; color: #7d838c; margin-left: auto; }
+  #status.ok { color: #6fcf7f; }
+  #status.err { color: #ff6b6b; }
+</style>
+</head>
+<body>
+<!-- SVG filter bank: used by the false-colour blend mode. -->
+<svg width="0" height="0" style="position:absolute;pointer-events:none" aria-hidden="true">
+  <defs>
+    <!-- Zero the green channel: pass R and B untouched, G → 0. -->
+    <filter id="f-no-green" color-interpolation-filters="sRGB">
+      <feColorMatrix type="matrix"
+        values="1 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0"/>
+    </filter>
+    <!-- Keep only the green channel: R → 0, G → G, B → 0. -->
+    <filter id="f-green-only" color-interpolation-filters="sRGB">
+      <feColorMatrix type="matrix"
+        values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0"/>
+    </filter>
+  </defs>
+</svg>
+<div id="toolbar">
+  <span class="brand">QuadAlign</span>
+  <span class="sep"></span>
+  <label>Opacity</label>
+  <button class="btn" onclick="setOpacity(0)">0%</button>
+  <button class="btn" onclick="setOpacity(0.5)">50%</button>
+  <button class="btn" onclick="setOpacity(1)">100%</button>
+  <input type="range" id="opacity-slider" min="0" max="100" value="50"
+         oninput="setOpacity(this.value/100)">
+  <span id="opacity-val">50%</span>
+  <span class="sep"></span>
+  <label>Blend</label>
+  <select id="blend-select" onchange="setBlend(this.value)">
+    <option value="normal">normal</option>
+    <option value="difference">difference</option>
+    <option value="screen">screen</option>
+    <option value="gcap">G=cap (false-colour)</option>
+  </select>
+  <span class="sep"></span>
+  <button class="btn active" id="btn-handles" onclick="toggleHandles()">Handles</button>
+  <button class="btn" id="btn-ref" onclick="toggleReference()">Reference</button>
+  <span class="sep"></span>
+  <label>Edge drag</label>
+  <button class="btn active" id="btn-edge-off"  onclick="setEdgeMode('off')">Off</button>
+  <button class="btn" id="btn-edge-parallel"    onclick="setEdgeMode('parallel')">Parallel</button>
+  <button class="btn" id="btn-edge-proportional" onclick="setEdgeMode('proportional')">Proportional</button>
+  <span class="sep"></span>
+  <button class="btn" onclick="fitView()">Fit (F)</button>
+  <button class="btn" onclick="resetVertices()">Reset</button>
+  <span class="sep"></span>
+  <button class="btn" style="border-color:#4a8f5a" onclick="saveResult()">Save JSON (S)</button>
+  <button class="btn" onclick="downloadResult()">Download</button>
+  <span id="status">loading…</span>
+</div>
+
+<div id="main">
+  <div id="viewport">
+    <div id="scene">
+      <img id="ref-img" src="/image/reference" alt="reference" draggable="false">
+      <img id="cap-img" src="/image/captured" alt="captured" draggable="false">
+      <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+  </div>
+
+  <div id="sidebar">
+    <div>
+      <div class="section-title">Vertices — absolute (reference px)</div>
+      <div class="vgrid">
+        <span></span><span class="head">X</span><span class="head">Y</span>
+        <div class="vrow" id="vrow-0" style="display:contents">
+          <label style="background:#c0392b" onclick="selectVertex(0)">TL</label>
+          <input id="in-0-x" type="number" step="0.5" onchange="setVertexFromInput(0)">
+          <input id="in-0-y" type="number" step="0.5" onchange="setVertexFromInput(0)">
+        </div>
+        <div class="vrow" id="vrow-1" style="display:contents">
+          <label style="background:#27924a" onclick="selectVertex(1)">TR</label>
+          <input id="in-1-x" type="number" step="0.5" onchange="setVertexFromInput(1)">
+          <input id="in-1-y" type="number" step="0.5" onchange="setVertexFromInput(1)">
+        </div>
+        <div class="vrow" id="vrow-2" style="display:contents">
+          <label style="background:#c79b1e" onclick="selectVertex(2)">BR</label>
+          <input id="in-2-x" type="number" step="0.5" onchange="setVertexFromInput(2)">
+          <input id="in-2-y" type="number" step="0.5" onchange="setVertexFromInput(2)">
+        </div>
+        <div class="vrow" id="vrow-3" style="display:contents">
+          <label style="background:#2f6fce" onclick="selectVertex(3)">BL</label>
+          <input id="in-3-x" type="number" step="0.5" onchange="setVertexFromInput(3)">
+          <input id="in-3-y" type="number" step="0.5" onchange="setVertexFromInput(3)">
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Vertices — relative (0–1)</div>
+      <div id="rel-coords"></div>
+    </div>
+
+    <div>
+      <div class="section-title">Keyboard</div>
+      <div class="hint">
+        <b>1–4</b> select TL/TR/BR/BL<br>
+        <b>&larr; &uarr; &rarr; &darr;</b> nudge 1&nbsp;px<br>
+        <b>Shift</b>+arrow nudge 10&nbsp;px&nbsp;&middot; <b>Alt</b>+arrow 0.1&nbsp;px<br>
+        <b>F</b> fit view &middot; <b>H</b> toggle handles<br>
+        <b>E</b> cycle edge drag mode (off → parallel → proportional)<br>
+        <b>[ ]</b> opacity &minus;/&plus; &middot; <b>D</b> difference blend<br>
+        <b>S</b> save &middot; wheel = zoom &middot; drag bg = pan
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Images</div>
+      <div id="img-info"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---- State -----------------------------------------------------------------
+const state = {
+  panX: 0, panY: 0, zoom: 1,
+  vertices: [[0, 0], [100, 0], [100, 100], [0, 100]], // TL TR BR BL (ref px)
+  selected: 0,
+  opacity: 0.5,
+  blend: "normal",
+  showHandles: true,
+  showReference: true,
+  edgeMode: "off",   // "off" | "parallel" | "proportional"
+  refW: 0, refH: 0,
+  capW: 0, capH: 0,
+  refPath: "", capPath: "", outputPath: "",
+  drag: null,
+  lastH: null,
+  needsRender: true,
+};
+
+const V_NAMES = ["TL", "TR", "BR", "BL"];
+const V_FILL = ["#c0392b", "#27924a", "#c79b1e", "#2f6fce"];
+// Edges as ordered vertex-index pairs: top, right, bottom, left.
+const EDGES = [[0, 1], [1, 2], [2, 3], [3, 0]];
+const E_NAMES = ["top", "right", "bottom", "left"];
+const HANDLE_R = 8;   // on-screen vertex handle radius (px)
+const EDGE_R = 6;     // on-screen edge handle half-size (px)
+const GRAB_R = 15;    // on-screen grab radius (px)
+
+// ---- DOM -------------------------------------------------------------------
+const viewport = document.getElementById("viewport");
+const scene    = document.getElementById("scene");
+const refImg   = document.getElementById("ref-img");
+const capImg   = document.getElementById("cap-img");
+const svg       = document.getElementById("overlay");
+const statusEl = document.getElementById("status");
+
+function setStatus(msg, cls) {
+  statusEl.textContent = msg;
+  statusEl.className = cls || "";
+}
+function invalidate() { state.needsRender = true; }
+
+// ---- Init ------------------------------------------------------------------
+async function init() {
+  let cfg;
+  try {
+    cfg = await (await fetch("/api/config")).json();
+  } catch (e) {
+    setStatus("config load failed: " + e.message, "err");
+    return;
+  }
+  state.refW = cfg.ref_width;  state.refH = cfg.ref_height;
+  state.capW = cfg.cap_width;  state.capH = cfg.cap_height;
+  state.outputPath = cfg.output_path;
+  state.refPath = cfg.ref_path;
+  state.capPath = cfg.cap_path;
+
+  document.getElementById("img-info").innerHTML =
+    "Ref: " + cfg.ref_filename + "<br>&nbsp;&nbsp;" + state.refW + " x " + state.refH +
+    "<br>Cap: " + cfg.cap_filename + "<br>&nbsp;&nbsp;" + state.capW + " x " + state.capH +
+    "<br><br>Output:<br>&nbsp;&nbsp;" + state.outputPath;
+
+  // Wait for images to have natural sizes, then size the scene.
+  await Promise.all([imgReady(refImg), imgReady(capImg)]);
+  scene.style.width  = state.refW + "px";
+  scene.style.height = state.refH + "px";
+  capImg.style.width  = state.capW + "px";
+  capImg.style.height = state.capH + "px";
+  svg.setAttribute("width", state.refW);
+  svg.setAttribute("height", state.refH);
+  svg.setAttribute("viewBox", "0 0 " + state.refW + " " + state.refH);
+  svg.style.width  = state.refW + "px";
+  svg.style.height = state.refH + "px";
+
+  if (cfg.input_vertices && cfg.input_vertices.length === 4) {
+    state.vertices = cfg.input_vertices.map(v => [v[0], v[1]]);
+  } else {
+    resetVertices();
+  }
+
+  fitView();
+  updateOpacityUI();
+  requestAnimationFrame(renderLoop);
+  setStatus("Ready — drag handles to align.", "ok");
+}
+
+function imgReady(img) {
+  return new Promise(res => {
+    if (img.complete && img.naturalWidth) res();
+    else img.onload = () => res();
+  });
+}
+
+function resetVertices() {
+  const w = state.refW || 100, h = state.refH || 100;
+  state.vertices = [[0, 0], [w, 0], [w, h], [0, h]];
+  invalidate();
+}
+
+// ---- Coordinate transforms -------------------------------------------------
+function clientToScene(cx, cy) {
+  const r = viewport.getBoundingClientRect();
+  return [
+    (cx - r.left - state.panX) / state.zoom,
+    (cy - r.top  - state.panY) / state.zoom,
+  ];
+}
+
+// ---- Homography (maps captured-image corners -> destination vertices) ------
+function gaussElim(A, b) {
+  const n = b.length;
+  const M = A.map((row, i) => row.concat([b[i]]));
+  for (let col = 0; col < n; col++) {
+    let piv = col, best = Math.abs(M[col][col]);
+    for (let r = col + 1; r < n; r++) {
+      const v = Math.abs(M[r][col]);
+      if (v > best) { best = v; piv = r; }
+    }
+    if (best < 1e-12) return null;              // singular / degenerate
+    if (piv !== col) { const t = M[col]; M[col] = M[piv]; M[piv] = t; }
+    const d = M[col][col];
+    for (let j = col; j <= n; j++) M[col][j] /= d;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col];
+      if (f === 0) continue;
+      for (let j = col; j <= n; j++) M[r][j] -= f * M[col][j];
+    }
+  }
+  return M.map(row => row[n]);
+}
+
+function solveHomography(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const sx = src[i][0], sy = src[i][1];
+    const dx = dst[i][0], dy = dst[i][1];
+    A.push([sx, sy, 1, 0, 0, 0, -sx * dx, -sy * dx]); b.push(dx);
+    A.push([0, 0, 0, sx, sy, 1, -sx * dy, -sy * dy]); b.push(dy);
+  }
+  const h = gaussElim(A, b);          // [h11,h12,h13,h21,h22,h23,h31,h32]
+  return h ? h.concat([1]) : null;
+}
+
+function homographyToCSS(H) {
+  const h11 = H[0], h12 = H[1], h13 = H[2];
+  const h21 = H[3], h22 = H[4], h23 = H[5];
+  const h31 = H[6], h32 = H[7];
+  // Column-major 4x4 matrix3d for a 2D projective transform.
+  return "matrix3d(" +
+    h11 + "," + h21 + ",0," + h31 + "," +
+    h12 + "," + h22 + ",0," + h32 + "," +
+    "0,0,1,0," +
+    h13 + "," + h23 + ",0,1)";
+}
+
+// ---- Render ----------------------------------------------------------------
+function renderLoop() {
+  if (state.needsRender) { state.needsRender = false; render(); }
+  requestAnimationFrame(renderLoop);
+}
+
+function render() {
+  scene.style.transform =
+    "translate(" + state.panX + "px," + state.panY + "px) scale(" + state.zoom + ")";
+
+  refImg.style.opacity = state.showReference ? 1 : 0;
+
+  const src = [[0, 0], [state.capW, 0], [state.capW, state.capH], [0, state.capH]];
+  const H = solveHomography(src, state.vertices);
+  if (H) state.lastH = H;
+  if (state.lastH) capImg.style.transform = homographyToCSS(state.lastH);
+
+  if (state.blend === "gcap") {
+    // False-colour: R,B from reference; G from captured.
+    // Achieved by: reference loses its green channel, captured keeps only green,
+    // then screen blend gives exactly (refR, capG, refB).
+    refImg.style.filter       = "url(#f-no-green)";
+    capImg.style.filter       = "url(#f-green-only)";
+    capImg.style.opacity      = "1";
+    capImg.style.mixBlendMode = "screen";
+  } else {
+    refImg.style.filter       = "";
+    capImg.style.filter       = "";
+    capImg.style.opacity      = state.opacity;
+    capImg.style.mixBlendMode = state.blend;
+  }
+
+  renderSVG();
+  renderCoords();
+}
+
+function renderSVG() {
+  if (!state.refW) return;
+  const vs = state.vertices;
+  const pts = vs.map(v => v[0] + "," + v[1]).join(" ");
+  const r  = HANDLE_R / state.zoom;
+  const sw = 1.5 / state.zoom;
+  const dash = 5 / state.zoom;
+  const fs = 13 / state.zoom;
+
+  let s = "";
+  const outlineStroke = state.showHandles ? "rgba(255,255,255,0.7)" : "rgba(255,255,255,0.35)";
+  s += '<polygon points="' + pts + '" fill="none" stroke="' + outlineStroke +
+       '" stroke-width="' + sw + '" stroke-dasharray="' + dash + " " + dash + '"/>';
+
+  if (state.showHandles) {
+    // Edge handles (drawn under vertex handles) when edge dragging is enabled.
+    if (state.edgeMode !== "off") {
+      const er = EDGE_R / state.zoom;
+      const dragIdx = (state.drag && state.drag.type === "edge") ? state.drag.idx : -1;
+      for (let i = 0; i < 4; i++) {
+        const a = vs[EDGES[i][0]], b = vs[EDGES[i][1]];
+        const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+        // Diamond marker at the edge midpoint.
+        const diamond = [
+          mx + "," + (my - er), (mx + er) + "," + my,
+          mx + "," + (my + er), (mx - er) + "," + my,
+        ].join(" ");
+        const active = i === dragIdx;
+        s += '<polygon points="' + diamond + '" fill="' +
+             (active ? "#5bc0ff" : "#e8e8e8") + '" stroke="' +
+             (active ? "#5bc0ff" : "rgba(0,0,0,0.6)") +
+             '" stroke-width="' + sw + '"/>';
+      }
+    }
+    for (let i = 0; i < 4; i++) {
+      const vx = vs[i][0], vy = vs[i][1];
+      const sel = i === state.selected;
+      const fill = sel ? "#ffffff" : V_FILL[i];
+      const stroke = sel ? V_FILL[i] : "rgba(0,0,0,0.6)";
+      s += '<circle cx="' + vx + '" cy="' + vy + '" r="' + r + '" fill="' + fill +
+           '" stroke="' + stroke + '" stroke-width="' + (sw * 1.5) + '"/>';
+      s += '<text x="' + (vx + r * 1.3) + '" y="' + (vy - r * 0.9) +
+           '" font-size="' + fs + '" font-family="monospace" fill="' + fill +
+           '" stroke="rgba(0,0,0,0.7)" stroke-width="' + (sw * 0.5) +
+           '" paint-order="stroke">' + V_NAMES[i] + '</text>';
+    }
+  }
+  svg.innerHTML = s;
+}
+
+function renderCoords() {
+  const inpIds = [
+    ["in-0-x", "in-0-y"], ["in-1-x", "in-1-y"],
+    ["in-2-x", "in-2-y"], ["in-3-x", "in-3-y"],
+  ];
+  const rowIds = ["vrow-0", "vrow-1", "vrow-2", "vrow-3"];
+  for (let i = 0; i < 4; i++) {
+    const xi = document.getElementById(inpIds[i][0]);
+    const yi = document.getElementById(inpIds[i][1]);
+    if (document.activeElement !== xi) xi.value = state.vertices[i][0].toFixed(1);
+    if (document.activeElement !== yi) yi.value = state.vertices[i][1].toFixed(1);
+    // Highlight selected row's inputs with a visible border
+    const sel = i === state.selected;
+    xi.style.outline = sel ? "2px solid #5bc0ff" : "";
+    yi.style.outline = sel ? "2px solid #5bc0ff" : "";
+  }
+  if (state.refW && state.refH) {
+    let html = "";
+    for (let i = 0; i < 4; i++) {
+      const rx = (state.vertices[i][0] / state.refW).toFixed(5);
+      const ry = (state.vertices[i][1] / state.refH).toFixed(5);
+      html += '<span class="k">' + V_NAMES[i] + "</span>&nbsp;" + rx + ", " + ry + "<br>";
+    }
+    document.getElementById("rel-coords").innerHTML = html;
+  }
+}
+
+// ---- View: fit & zoom ------------------------------------------------------
+function fitView() {
+  const r = viewport.getBoundingClientRect();
+  const pad = 40;
+  const z = Math.min((r.width - pad) / state.refW, (r.height - pad) / state.refH);
+  state.zoom = z > 0 ? z : 1;
+  state.panX = (r.width  - state.refW * state.zoom) / 2;
+  state.panY = (r.height - state.refH * state.zoom) / 2;
+  invalidate();
+}
+
+// ---- Vertex hit-test & selection -------------------------------------------
+function vertexAt(cx, cy) {
+  const grab = GRAB_R;                 // screen px
+  let bestI = -1, bestD = grab;
+  const r = viewport.getBoundingClientRect();
+  for (let i = 0; i < 4; i++) {
+    const sx = r.left + state.panX + state.vertices[i][0] * state.zoom;
+    const sy = r.top  + state.panY + state.vertices[i][1] * state.zoom;
+    const d = Math.hypot(cx - sx, cy - sy);
+    if (d <= bestD) { bestD = d; bestI = i; }
+  }
+  return bestI;
+}
+
+// Returns {idx, t} for the nearest edge within grab distance, else null.
+// t is the parametric position along the edge (0 at vertex A, 1 at vertex B).
+function edgeAt(cx, cy) {
+  if (state.edgeMode === "off") return null;
+  const r = viewport.getBoundingClientRect();
+  let bestI = -1, bestT = 0.5, bestD = GRAB_R;
+  for (let i = 0; i < 4; i++) {
+    const a = state.vertices[EDGES[i][0]], b = state.vertices[EDGES[i][1]];
+    const ax = r.left + state.panX + a[0] * state.zoom;
+    const ay = r.top  + state.panY + a[1] * state.zoom;
+    const bx = r.left + state.panX + b[0] * state.zoom;
+    const by = r.top  + state.panY + b[1] * state.zoom;
+    const ex = bx - ax, ey = by - ay;
+    const len2 = ex * ex + ey * ey;
+    if (len2 < 1) continue;
+    let t = ((cx - ax) * ex + (cy - ay) * ey) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(cx - (ax + t * ex), cy - (ay + t * ey));
+    if (d < bestD) { bestD = d; bestI = i; bestT = t; }
+  }
+  return bestI >= 0 ? { idx: bestI, t: bestT } : null;
+}
+
+function selectVertex(i) { state.selected = i; invalidate(); }
+
+function setVertexFromInput(i) {
+  const x = parseFloat(document.getElementById("in-" + i + "-x").value);
+  const y = parseFloat(document.getElementById("in-" + i + "-y").value);
+  if (!Number.isNaN(x)) state.vertices[i][0] = x;
+  if (!Number.isNaN(y)) state.vertices[i][1] = y;
+  state.selected = i;
+  invalidate();
+}
+
+// ---- Pointer interaction ---------------------------------------------------
+viewport.addEventListener("pointerdown", ev => {
+  viewport.setPointerCapture(ev.pointerId);
+  const hit = vertexAt(ev.clientX, ev.clientY);
+  if (hit >= 0) {
+    state.selected = hit;
+    state.drag = { type: "vertex", idx: hit };
+  } else {
+    const eHit = edgeAt(ev.clientX, ev.clientY);
+    if (eHit) {
+      state.drag = {
+        type: "edge",
+        idx: eHit.idx,
+        t: eHit.t,           // grab position along edge (0 = vertex A, 1 = vertex B)
+        lastX: ev.clientX,
+        lastY: ev.clientY,
+      };
+    } else {
+      state.drag = {
+        type: "pan",
+        ox: ev.clientX, oy: ev.clientY,
+        opx: state.panX, opy: state.panY,
+      };
+      viewport.classList.add("panning");
+    }
+  }
+  invalidate();
+});
+
+viewport.addEventListener("pointermove", ev => {
+  if (!state.drag) return;
+  if (state.drag.type === "vertex") {
+    const p = clientToScene(ev.clientX, ev.clientY);
+    state.vertices[state.drag.idx][0] = p[0];
+    state.vertices[state.drag.idx][1] = p[1];
+  } else if (state.drag.type === "edge") {
+    // Incremental delta in scene units.
+    const dx = (ev.clientX - state.drag.lastX) / state.zoom;
+    const dy = (ev.clientY - state.drag.lastY) / state.zoom;
+    state.drag.lastX = ev.clientX;
+    state.drag.lastY = ev.clientY;
+    const ai = EDGES[state.drag.idx][0];
+    const bi = EDGES[state.drag.idx][1];
+    const t = state.drag.t;
+    if (state.edgeMode === "parallel") {
+      // Both vertices shift by the same delta — edge stays parallel to itself.
+      state.vertices[ai][0] += dx; state.vertices[ai][1] += dy;
+      state.vertices[bi][0] += dx; state.vertices[bi][1] += dy;
+    } else {
+      // Proportional: vertex A moves (1-t)×Δ, vertex B moves t×Δ.
+      // Grabbing near A concentrates movement there; grabbing the midpoint
+      // gives equal movement; grabbing near B concentrates it at B.
+      state.vertices[ai][0] += (1 - t) * dx; state.vertices[ai][1] += (1 - t) * dy;
+      state.vertices[bi][0] +=       t  * dx; state.vertices[bi][1] +=       t  * dy;
+    }
+  } else {
+    state.panX = state.drag.opx + (ev.clientX - state.drag.ox);
+    state.panY = state.drag.opy + (ev.clientY - state.drag.oy);
+  }
+  invalidate();
+});
+
+function endDrag(ev) {
+  if (state.drag) {
+    try { viewport.releasePointerCapture(ev.pointerId); } catch (e) {}
+    state.drag = null;
+    viewport.classList.remove("panning");
+  }
+}
+viewport.addEventListener("pointerup", endDrag);
+viewport.addEventListener("pointercancel", endDrag);
+
+viewport.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const r = viewport.getBoundingClientRect();
+  const px = ev.clientX - r.left, py = ev.clientY - r.top;
+  const sx = (px - state.panX) / state.zoom;
+  const sy = (py - state.panY) / state.zoom;
+  const factor = Math.exp(-ev.deltaY * 0.0015);
+  state.zoom = Math.max(0.02, Math.min(60, state.zoom * factor));
+  state.panX = px - sx * state.zoom;
+  state.panY = py - sy * state.zoom;
+  invalidate();
+}, { passive: false });
+
+// ---- Keyboard --------------------------------------------------------------
+window.addEventListener("keydown", ev => {
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === "INPUT" || tag === "SELECT") return;
+
+  const key = ev.key;
+  if (key >= "1" && key <= "4") { selectVertex(parseInt(key, 10) - 1); return; }
+
+  let step = 1;
+  if (ev.shiftKey) step = 10;
+  else if (ev.altKey) step = 0.1;
+
+  let handled = true;
+  switch (key) {
+    case "ArrowLeft":  state.vertices[state.selected][0] -= step; break;
+    case "ArrowRight": state.vertices[state.selected][0] += step; break;
+    case "ArrowUp":    state.vertices[state.selected][1] -= step; break;
+    case "ArrowDown":  state.vertices[state.selected][1] += step; break;
+    case "f": case "F": fitView(); break;
+    case "h": case "H": toggleHandles(); break;
+    case "e": case "E": cycleEdgeMode(); break;
+    case "d": case "D":
+      setBlend(state.blend === "difference" ? "normal" : "difference");
+      document.getElementById("blend-select").value = state.blend; break;
+    case "[": setOpacity(Math.max(0, state.opacity - 0.1)); break;
+    case "]": setOpacity(Math.min(1, state.opacity + 0.1)); break;
+    case "s": case "S": saveResult(); break;
+    default: handled = false;
+  }
+  if (handled) { ev.preventDefault(); invalidate(); }
+});
+
+// ---- Controls --------------------------------------------------------------
+function setOpacity(v) {
+  state.opacity = Math.max(0, Math.min(1, v));
+  updateOpacityUI();
+  invalidate();
+}
+function updateOpacityUI() {
+  const pct = Math.round(state.opacity * 100);
+  document.getElementById("opacity-slider").value = pct;
+  document.getElementById("opacity-val").textContent = pct + "%";
+}
+function setBlend(b) { state.blend = b; document.getElementById("blend-select").value = b; invalidate(); }
+function toggleHandles() {
+  state.showHandles = !state.showHandles;
+  document.getElementById("btn-handles").classList.toggle("active", state.showHandles);
+  invalidate();
+}
+function toggleReference() {
+  state.showReference = !state.showReference;
+  document.getElementById("btn-ref").classList.toggle("active", state.showReference);
+  invalidate();
+}
+function setEdgeMode(mode) {
+  state.edgeMode = mode;
+  document.getElementById("btn-edge-off").classList.toggle("active", mode === "off");
+  document.getElementById("btn-edge-parallel").classList.toggle("active", mode === "parallel");
+  document.getElementById("btn-edge-proportional").classList.toggle("active", mode === "proportional");
+  invalidate();
+}
+function cycleEdgeMode() {
+  const modes = ["off", "parallel", "proportional"];
+  setEdgeMode(modes[(modes.indexOf(state.edgeMode) + 1) % modes.length]);
+}
+
+// ---- Output ----------------------------------------------------------------
+function buildOutput() {
+  const keys = ["tl", "tr", "br", "bl"];
+  const vertices = {};
+  for (let i = 0; i < 4; i++) {
+    vertices[keys[i]] = {
+      x_abs: state.vertices[i][0],
+      y_abs: state.vertices[i][1],
+      x_rel: state.vertices[i][0] / state.refW,
+      y_rel: state.vertices[i][1] / state.refH,
+    };
+  }
+  return {
+    reference: { path: state.refPath, width: state.refW, height: state.refH },
+    captured:  { path: state.capPath, width: state.capW, height: state.capH },
+    vertices: vertices,
+  };
+}
+
+async function saveResult() {
+  setStatus("saving…");
+  try {
+    const res = await fetch("/api/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildOutput()),
+    });
+    const j = await res.json();
+    if (j.ok) setStatus("saved: " + j.saved_to, "ok");
+    else setStatus("save failed: " + (j.error || "unknown"), "err");
+  } catch (e) {
+    setStatus("save failed: " + e.message, "err");
+  }
+}
+
+function downloadResult() {
+  const blob = new Blob([JSON.stringify(buildOutput(), null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "alignment.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+window.addEventListener("resize", invalidate);
+init();
+</script>
+</body>
+</html>

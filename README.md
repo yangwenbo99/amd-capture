@@ -18,6 +18,12 @@
       The checker is placed with its top edge around h/2 (small random jitter),
       and scaled as large as possible while constrained to <= 1/2 image width
       and <= 1/4 image height.
+    - `apply_geometry_transform.py`: to reproduce the exact geometry transform used in capturing the images
+- `alignment/`: Script used to align the captured images with the ground-truth
+    - `align_quad.py`: interactive coarse reference-to-captured alignment tool.
+      Starts a local web server and opens a browser UI where you drag four
+      vertex handles to wrap the recaptured image in a quadrilateral overlaid
+      on the reference, then save the result as JSON.
 
 
 ## HTTP Server
@@ -87,3 +93,26 @@ python3 misc_scripts/embed_color_checker.py \
   --output-dir out_images \
   --checker color_checker.png
 ```
+
+## alignment
+
+### Quad alignment tool
+
+Requires Pillow or OpenImageIO for non-web image formats (EXR, TIFF, …).
+
+```bash
+python3 alignment/align_quad.py \
+  --reference ref.exr \
+  --captured  cap.bmp \
+  [--input-json previous.json] \
+  [--output result.json]
+```
+
+A browser window opens automatically. Drag the four coloured corner handles
+(TL / TR / BR / BL) to align the captured image over the reference. Use the
+opacity slider or `[ ]` keys to blend between the two layers; switch to
+**Difference** blend mode for pixel-precise alignment. Press **S** or click
+**Save JSON** when done.
+
+The output JSON records each vertex as both absolute reference-pixel
+coordinates and normalised [0, 1] relative coordinates.

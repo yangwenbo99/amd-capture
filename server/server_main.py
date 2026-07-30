@@ -42,16 +42,17 @@ import threading
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from pywinauto import Application
 from pywinauto.findwindows import ElementNotFoundError
 from pywinauto import mouse
-import time
+import subprocess
 
 # =========================
 # Configuration
@@ -62,8 +63,14 @@ PORT = 48765
 
 WATCH_FOLDER = Path(r"C:\Users\Administrator\Documents\EFFP_new\EFFP_ISProj\RawCapture")
 
-EXPECTED_FILE_GLOB = "*.bmp"
-EXPECTED_FILE_COUNT = 1
+#Path and other configs used for restarting the capture software
+APP_EXE_PATH = r"C:\IS\0.0.0\IS.exe" 
+APP_PROCESS_NAME = "IS.exe"
+APP_STARTUP_DELAY_SEC = 30.0
+
+# EXPECTED_FILE_GLOB = "*.bmp"
+EXPECTED_FILE_GLOB = "*.raw,*.bmp"
+EXPECTED_FILE_COUNT = 2
 CAPTURE_TIMEOUT_SEC = 20.0
 POLL_INTERVAL_SEC = 0.25
 
@@ -79,16 +86,6 @@ BUTTON_CONTROL_TYPE = "Button"
 
 PRE_CLICK_DELAY_SEC = 0.1
 POST_CLICK_DELAY_SEC = 0.1
-
-# Maximum time to wait for a single click attempt (click_input/invoke/mouse.click)
-# to return before we abandon it and try the next strategy. pywinauto's click
-# methods drive real Win32 input and have no built-in timeout, so they can hang
-# indefinitely if the desktop is locked, the input queue is stuck, or the target
-# window's UI thread is unresponsive.
-CLICK_ATTEMPT_TIMEOUT_SEC = 5.0
-# Maximum time to wait for window focus operations (set_focus / minimize /
-# maximize) to return. These can also hang on an unresponsive UI thread.
-FOCUS_ATTEMPT_TIMEOUT_SEC = 5.0
 
 API_TOKEN = None  # e.g. "my-lan-secret"
 
@@ -158,14 +155,102 @@ class LastStatus:
 # =========================
 
 app = FastAPI(title="LAN Capture Server")
-capture_lock = threading.Lock()
+
+capture_lock = threading.RLock()
 last_status: Optional[LastStatus] = None
 
 
 # =========================
 # Helpers
 # =========================
+def clear_watch_folder(folder: Path) -> None:
+    """Deletes every file and subfolder inside the watch folder to ensure a completely clean slate."""
+    logger.info("Emptying results folder (including subfolders): %s", folder)
+    if not folder.exists():
+        return
+        
+    for item in folder.iterdir():
+        try:
+            if item.is_file() or item.is_symlink():
+                item.unlink()  # Deletes standard files
+            elif item.is_dir():
+                shutil.rmtree(item)  # Recursively deletes folders and their contents
+        except Exception as exc:
+            logger.warning("Could not delete item '%s': %s", item.name, exc)
 
+def matches_pattern(filename: str, pattern_str: Optional[str]) -> bool:
+    """Supports comma-separated glob patterns, e.g., '*.raw,*.bmp'"""
+    if not pattern_str:
+        return True
+    patterns = [p.strip() for p in pattern_str.split(",") if p.strip()]
+    return any(fnmatch.fnmatch(filename.lower(), p.lower()) for p in patterns)
+
+def restart_camera_app() -> bool:
+    """
+    Safely force-kills and relaunches the capture GUI application.
+    """
+    logger.info("Initiating automated recovery restart of '%s'...", APP_PROCESS_NAME)
+    
+    with capture_lock:
+        try:
+            # 1. Force-kill any broken or frozen instances
+            subprocess.run(
+                ["taskkill", "/F", "/IM", APP_PROCESS_NAME],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            time.sleep(1.5)  
+
+            # 2. Relaunch the application
+            logger.info("Relaunching GUI from: %s", APP_EXE_PATH)
+            Application(backend=BACKEND).start(APP_EXE_PATH, work_dir=r"C:\IS\0.0.0")
+            
+            # 3. Wait for the UI and camera sensors to boot up
+            logger.info("Waiting %.1f seconds for GUI sensors to initialize...", APP_STARTUP_DELAY_SEC)
+            time.sleep(APP_STARTUP_DELAY_SEC)
+            
+            logger.info("Camera application recovery successful!")
+            return True
+            
+        except Exception as exc:
+            logger.error("Failed to restart camera app during recovery: %s", exc)
+            return False
+def turn_on_auto_exposure() -> None:
+    """
+    Locates the 'Auto Exposure' text label and clicks the toggle physically next to it.
+    """
+    logger.info("Attempting to turn on 'Auto Exposure'...")
+    _, window = connect_to_window()
+
+    try:
+        # Focus window to ensure the click registers properly
+        window.set_focus()
+    except Exception:
+        pass
+
+    try:
+        # 1. Find the exact text label
+        label = window.child_window(title="Auto Exposure")
+        label.wait("exists ready", timeout=5)
+        wrapper = label.wrapper_object()
+
+        # 2. Get the rectangle coordinates of the text
+        rect = wrapper.rectangle()
+
+        # 3. Calculate a click coordinate physically to the right of the text label.
+        # Adding 40 pixels to the right edge usually hits the center of the toggle.
+        click_x = rect.right + 40
+        click_y = rect.mid_point().y
+        
+        # 4. Perform a coordinate click
+        mouse.click(coords=(click_x, click_y))
+        logger.info("Successfully clicked the toggle to the right of 'Auto Exposure'.")
+        time.sleep(0.5)
+
+    except Exception as exc:
+        raise RuntimeError(f"Could not process 'Auto Exposure' element: {exc}") from exc
+        
 def check_token(token: Optional[str]) -> None:
     if API_TOKEN is None:
         return
@@ -246,7 +331,7 @@ def list_files_in_folder(
     for p in folder.iterdir():
         if not p.is_file():
             continue
-        if pattern and not fnmatch.fnmatch(p.name, pattern):
+        if not matches_pattern(p.name, pattern):
             continue
 
         stat = p.stat()
@@ -331,7 +416,8 @@ def snapshot_matching_files(folder: Path, pattern: str) -> set[Path]:
     return {
         p.resolve()
         for p in folder.iterdir()
-        if p.is_file() and fnmatch.fnmatch(p.name, pattern)
+        # Use matches_pattern instead of fnmatch
+        if p.is_file() and matches_pattern(p.name, pattern)
     }
 
 
@@ -397,89 +483,21 @@ def resolve_button(window):
 
 
 
-class _ClickTimeoutError(RuntimeError):
-    """Raised when a click/focus attempt exceeds its allotted timeout."""
-
-
-def run_with_timeout(
-    func,
-    timeout_sec: float,
-    description: str,
-):
-    """
-    Run ``func()`` in a daemon thread and wait up to ``timeout_sec`` seconds.
-
-    Returns the function's return value on success.
-    Re-raises any exception the function raised.
-    Raises ``_ClickTimeoutError`` if the call did not return in time.
-
-    Note: when a timeout occurs, the worker thread is *abandoned*, not killed,
-    because Python cannot safely interrupt a thread blocked in a Win32 call.
-    The thread is daemonic so it will not prevent process exit. If clicks hang
-    repeatedly, the leaked threads accumulate and the server should be
-    restarted.
-    """
-    result: dict[str, Any] = {}
-
-    def _runner() -> None:
-        try:
-            result["value"] = func()
-        except BaseException as exc:  # noqa: BLE001
-            result["error"] = exc
-
-    thread = threading.Thread(
-        target=_runner,
-        name=f"click-attempt:{description}",
-        daemon=True,
-    )
-    thread.start()
-    thread.join(timeout=timeout_sec)
-
-    if thread.is_alive():
-        raise _ClickTimeoutError(
-            f"{description} did not complete within {timeout_sec:.1f}s "
-            f"(thread abandoned)"
-        )
-
-    if "error" in result:
-        raise result["error"]
-    return result.get("value")
-
-
 def perform_capture_click() -> None:
     _, window = connect_to_window()
 
     logger.info("Connected to target window.")
 
     # For UIA backend, restore() is not always reliable, so ignore failures.
-    # Each focus call is wrapped with a timeout because set_focus / minimize /
-    # maximize can hang on an unresponsive UI thread.
     try:
-        run_with_timeout(
-            window.set_focus,
-            timeout_sec=FOCUS_ATTEMPT_TIMEOUT_SEC,
-            description="window.set_focus()",
-        )
-    except Exception as first_focus_exc:
-        logger.warning("Initial set_focus failed: %r", first_focus_exc)
+        window.set_focus()
+    except Exception:
         try:
-            run_with_timeout(
-                window.minimize,
-                timeout_sec=FOCUS_ATTEMPT_TIMEOUT_SEC,
-                description="window.minimize()",
-            )
+            window.minimize()
             time.sleep(0.2)
-            run_with_timeout(
-                window.maximize,
-                timeout_sec=FOCUS_ATTEMPT_TIMEOUT_SEC,
-                description="window.maximize()",
-            )
+            window.maximize()
             time.sleep(0.3)
-            run_with_timeout(
-                window.set_focus,
-                timeout_sec=FOCUS_ATTEMPT_TIMEOUT_SEC,
-                description="window.set_focus() (retry)",
-            )
+            window.set_focus()
         except Exception as exc:
             raise RuntimeError(f"Unable to focus target window: {exc}") from exc
 
@@ -512,22 +530,12 @@ def perform_capture_click() -> None:
     except Exception:
         logger.info("Button resolved, but failed to read debug properties.")
 
-    # Each click attempt below is wrapped in run_with_timeout because pywinauto's
-    # click methods can hang indefinitely on an unresponsive desktop / UI thread.
-    # On timeout we log and fall through to the next strategy.
-
     # Attempt 1: normal click_input()
     try:
-        run_with_timeout(
-            button.click_input,
-            timeout_sec=CLICK_ATTEMPT_TIMEOUT_SEC,
-            description="button.click_input()",
-        )
+        button.click_input()
         logger.info("Capture button clicked with click_input().")
         time.sleep(POST_CLICK_DELAY_SEC)
         return
-    except _ClickTimeoutError as exc:
-        logger.error("click_input() hung: %s", exc)
     except Exception as exc:
         logger.warning("click_input() failed: %r", exc)
 
@@ -536,16 +544,10 @@ def perform_capture_click() -> None:
         method = getattr(button, method_name, None)
         if callable(method):
             try:
-                run_with_timeout(
-                    method,
-                    timeout_sec=CLICK_ATTEMPT_TIMEOUT_SEC,
-                    description=f"button.{method_name}()",
-                )
+                method()
                 logger.info("Capture button activated with %s().", method_name)
                 time.sleep(POST_CLICK_DELAY_SEC)
                 return
-            except _ClickTimeoutError as exc:
-                logger.error("%s() hung: %s", method_name, exc)
             except Exception as exc:
                 logger.warning("%s() failed: %r", method_name, exc)
 
@@ -555,18 +557,10 @@ def perform_capture_click() -> None:
         if rect.width() <= 0 or rect.height() <= 0:
             raise RuntimeError("Button rectangle is empty.")
         center = rect.mid_point()
-        run_with_timeout(
-            lambda: mouse.click(coords=(center.x, center.y)),
-            timeout_sec=CLICK_ATTEMPT_TIMEOUT_SEC,
-            description=f"mouse.click(({center.x},{center.y}))",
-        )
+        mouse.click(coords=(center.x, center.y))
         logger.info("Capture button clicked by screen coordinates at (%d, %d).", center.x, center.y)
         time.sleep(POST_CLICK_DELAY_SEC)
         return
-    except _ClickTimeoutError as exc:
-        raise RuntimeError(
-            f"All button click methods failed; last attempt timed out: {exc}"
-        ) from exc
     except Exception as exc:
         raise RuntimeError(f"All button click methods failed. Last error: {exc}") from exc
 
@@ -581,46 +575,73 @@ def run_capture(
 
     started = time.time()
 
-    baseline_files = snapshot_matching_files(watch_folder, expected_glob)
-    logger.info(
-        "Capture started. request_id=%s folder=%s pattern=%s count=%d baseline=%d",
-        request_id, watch_folder, expected_glob, expected_count, len(baseline_files)
-    )
+    # Flag to track whether we have already attempted a restart for this run
+    restarted_once = False
 
-    try:
-        perform_capture_click()
-    except ElementNotFoundError as exc:
-        ended = time.time()
-        resp = CaptureResponse(
-            ok=False,
-            message=f"UI element not found: {exc}",
-            request_id=request_id,
-            started_at_unix=started,
-            ended_at_unix=ended,
-            elapsed_sec=ended - started,
-            files_found=[],
-            watch_folder=str(watch_folder),
-            expected_glob=expected_glob,
-            expected_count=expected_count,
+    while True:
+
+        clear_watch_folder(watch_folder)
+
+        baseline_files = snapshot_matching_files(watch_folder, expected_glob)
+        logger.info(
+            "Capture started. request_id=%s folder=%s pattern=%s count=%d baseline=%d",
+            request_id, watch_folder, expected_glob, expected_count, len(baseline_files)
         )
-        last_status = LastStatus(**resp.model_dump())
-        return resp
-    except Exception as exc:
-        ended = time.time()
-        resp = CaptureResponse(
-            ok=False,
-            message=f"GUI automation failed: {exc}",
-            request_id=request_id,
-            started_at_unix=started,
-            ended_at_unix=ended,
-            elapsed_sec=ended - started,
-            files_found=[],
-            watch_folder=str(watch_folder),
-            expected_glob=expected_glob,
-            expected_count=expected_count,
-        )
-        last_status = LastStatus(**resp.model_dump())
-        return resp
+
+        try:
+            perform_capture_click()
+        except ElementNotFoundError as exc:
+            ended = time.time()
+            logger.error("UI ERROR: Capture button not found! App likely crashed or froze. Triggering restart...")
+            
+            res = restart_camera_app()
+            # If the app restarted successfully and we haven't tried yet, retry the capture
+            if res and not restarted_once:
+                logger.info("Camera app restarted successfully. Enabling auto exposure...")
+                try:
+                    turn_on_auto_exposure() 
+                except Exception as toggle_err:
+                    logger.warning(f"Failed to enable auto exposure after restart: {toggle_err}")
+
+                logger.info("Retrying capture...")
+                restarted_once = True
+                continue
+            
+            # If restart failed or we already retried once, fall through to return error response
+            resp = CaptureResponse(
+                ok=False,
+                message=f"UI element not found: {exc} (App restart failed or already attempted)",
+                request_id=request_id,
+                started_at_unix=started,
+                ended_at_unix=ended,
+                elapsed_sec=ended - started,
+                files_found=[],
+                watch_folder=str(watch_folder),
+                expected_glob=expected_glob,
+                expected_count=expected_count,
+            )
+            last_status = LastStatus(**resp.model_dump())
+            return resp
+            
+        except Exception as exc:
+            ended = time.time()
+            resp = CaptureResponse(
+                ok=False,
+                message=f"GUI automation failed: {exc}",
+                request_id=request_id,
+                started_at_unix=started,
+                ended_at_unix=ended,
+                elapsed_sec=ended - started,
+                files_found=[],
+                watch_folder=str(watch_folder),
+                expected_glob=expected_glob,
+                expected_count=expected_count,
+            )
+            last_status = LastStatus(**resp.model_dump())
+            return resp
+
+        # Break out of the loop if perform_capture_click succeeded
+        break
 
     found_files = wait_for_new_files(
         folder=watch_folder,
@@ -637,7 +658,6 @@ def run_capture(
         if ok
         else f"Timed out waiting for {expected_count} new file(s) matching {expected_glob}."
     )
-    logger.info("message")
 
     resp = CaptureResponse(
         ok=ok,
@@ -661,10 +681,14 @@ def run_capture(
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+
+    is_free = capture_lock.acquire(blocking=False)
+    if is_free:
+        capture_lock.release()
     return {
         "ok": True,
         "service": "capture_server",
-        "busy": capture_lock.locked(),
+        "busy": not is_free,
     }
 
 
@@ -726,11 +750,6 @@ def pull_file(
     token: Optional[str] = Query(default=None),
     watch_folder: Optional[str] = Query(default=None),
 ):
-    """
-    Download a file from the monitored directory.
-    Example:
-        GET /pull?name=img001.png
-    """
     check_token(token)
     folder = resolve_watch_folder(watch_folder)
     file_path = safe_child_path(folder, name)
@@ -749,7 +768,6 @@ def pull_file(
         media_type=media_type,
         filename=file_path.name,
     )
-
 
 @app.delete("/files/{name}")
 def delete_file(

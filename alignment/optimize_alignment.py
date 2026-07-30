@@ -338,81 +338,97 @@ def build_output(
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Directory-mode helpers
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Gradient-based fine-tuning of a quad alignment.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("--reference",  required=True, help="reference image path")
-    p.add_argument("--captured",   required=True, help="recaptured image path")
-    p.add_argument("--input-json", required=True,
-                   help="alignment JSON produced by align_quad.py (mandatory)")
-    p.add_argument("--loss", default="ms-ssim", metavar="FUNC",
-                   help="loss function: ms-ssim or dists")
-    p.add_argument("--greyscale", action="store_true",
-                   help="convert both images to greyscale before loss")
-    p.add_argument("--iters", type=int, default=300,
-                   help="number of optimisation steps")
-    p.add_argument("--lr", type=float, default=None,
-                   help="learning rate (default 0.005 for adam, 0.5 for lbfgs)")
-    p.add_argument("--optimizer", choices=("adam", "lbfgs"), default="adam")
-    p.add_argument("--max-size", type=int, default=512,
-                   help="longest edge of the working resolution for loss computation")
-    p.add_argument("--output", default=None,
-                   help="output JSON (default: <captured_stem>.align.opt.json)")
-    p.add_argument("--report-every", type=int, default=50,
-                   help="print loss every N iterations")
-    p.add_argument("--device", default=None,
-                   help="torch device (default: cuda if available, else cpu)")
-    g = p.add_argument_group("comparison output")
-    g.add_argument("--compare-before", default=None, metavar="PATH",
-                   help="save pre-optimisation comparison image to this path")
-    g.add_argument("--compare-after", default=None, metavar="PATH",
-                   help="save post-optimisation comparison image to this path")
-    g.add_argument("--compare-blend", nargs="+", default=["normal"],
-                   choices=["normal", "gcap"], metavar="MODE",
-                   help="blend mode(s) for comparison: normal gcap (default: normal)")
-    g.add_argument("--compare-opacity", type=float, default=0.5,
-                   help="overlay opacity for normal blend (default: 0.5)")
-    g.add_argument("--compare-size", type=int, default=0,
-                   help="max resolution of comparison images in pixels "
-                        "(default: full reference resolution)")
-    return p.parse_args()
+_IMAGE_EXTENSIONS = {
+    ".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff",
+    ".exr", ".hdr", ".ppm", ".pgm",
+}
+
+
+def _is_image(path: Path) -> bool:
+    return path.suffix.lower() in _IMAGE_EXTENSIONS
+
+
+def _extract_ref_stem(cap_path: Path) -> "str | None":
+    """
+    Return the reference stem encoded in a captured filename.
+
+    Convention: cap-XXXX-YYY_<ref-stem>.<ext>
+    The ref-stem is everything after the *last* underscore, without extension.
+    Returns None if no underscore is present.
+    """
+    stem = cap_path.stem          # e.g. "cap-0001-002_0000000-032"
+    idx = stem.rfind("_")
+    if idx == -1:
+        return None
+    return stem[idx + 1:]         # e.g. "0000000-032"
+
+
+def _find_reference_files(ref_dir: Path, ref_stem: str) -> list:
+    """Return all image files in ref_dir whose stem matches ref_stem, sorted."""
+    matches = [
+        f for f in ref_dir.iterdir()
+        if f.is_file() and _is_image(f) and f.stem == ref_stem
+    ]
+    return sorted(matches)
+
+
+def _build_pairs(ref_dir: Path, cap_dir: Path) -> list:
+    """
+    Build the list of (reference, captured) path pairs.
+
+    Each captured image encodes a reference stem in its filename
+    (everything after the last '_', without extension).  All reference
+    files with that stem (any extension) inside ref_dir are matched.
+    Captured files are iterated in sorted order.
+    """
+    cap_files = sorted(f for f in cap_dir.iterdir() if f.is_file() and _is_image(f))
+    pairs = []
+    for cap in cap_files:
+        ref_stem = _extract_ref_stem(cap)
+        if ref_stem is None:
+            print(
+                f"[warn] cannot extract reference stem from '{cap.name}'; skipping",
+                file=sys.stderr,
+            )
+            continue
+        refs = _find_reference_files(ref_dir, ref_stem)
+        if not refs:
+            print(
+                f"[warn] no reference file with stem '{ref_stem}' found for "
+                f"'{cap.name}'; skipping",
+                file=sys.stderr,
+            )
+            continue
+        for ref in refs:
+            pairs.append((ref, cap))
+    return pairs
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Single-pair processing
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    args = parse_args()
-
-    ref_path = Path(args.reference).resolve()
-    cap_path = Path(args.captured).resolve()
-    json_path = Path(args.input_json).resolve()
-    for p in (ref_path, cap_path, json_path):
-        if not p.is_file():
-            print(f"error: file not found: {p}", file=sys.stderr)
-            return 2
-
-    # ---- device ----
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}")
-
-    # ---- loss ----
-    try:
-        loss_name, loss_fn = build_loss(args.loss)  # type: ignore[assignment]
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    loss_fn = loss_fn.to(device)
-    print(f"loss:   {loss_name}")
+def process_pair(
+    ref_path: Path,
+    cap_path: Path,
+    json_data: dict,
+    args: argparse.Namespace,
+    device: "torch.device",
+    loss_name: str,
+    loss_fn,
+    out_json: Path,
+    compare_before: "Path | None",
+    compare_after: "Path | None",
+) -> int:
+    """
+    Optimise alignment for one (reference, captured) pair.
+    Returns 0 on success, non-zero on error.
+    """
+    print(f"\n{'='*60}")
+    print(f"pair: {cap_path.name}  <->  {ref_path.name}")
 
     # ---- load images ----
     print(f"loading reference : {ref_path}")
@@ -425,9 +441,8 @@ def main() -> int:
     cap_h_full, cap_w_full = cap_arr.shape[:2]
     print(f"  {cap_w_full}x{cap_h_full} x{cap_arr.shape[2]}ch")
 
-    # ---- load vertices from JSON (use relative coords) ----
-    data = json.loads(json_path.read_text(encoding="utf-8"))
-    vd = data.get("vertices", {})
+    # ---- load vertices from JSON ----
+    vd = json_data.get("vertices", {})
     if not all(k in vd for k in _V_KEYS):
         print(f"error: JSON missing vertex keys {_V_KEYS}", file=sys.stderr)
         return 2
@@ -435,8 +450,8 @@ def main() -> int:
         init_coords = [[vd[k]["x_rel"], vd[k]["y_rel"]] for k in _V_KEYS]
     except KeyError:
         # Fallback: absolute coords normalised by JSON-reported reference dims.
-        jrw = data.get("reference", {}).get("width", ref_w_full)
-        jrh = data.get("reference", {}).get("height", ref_h_full)
+        jrw = json_data.get("reference", {}).get("width", ref_w_full)
+        jrh = json_data.get("reference", {}).get("height", ref_h_full)
         init_coords = [
             [vd[k]["x_abs"] / jrw, vd[k]["y_abs"] / jrh] for k in _V_KEYS
         ]
@@ -496,11 +511,11 @@ def main() -> int:
     comp_size = args.compare_size if args.compare_size > 0 else max(ref_h_full, ref_w_full)
 
     # ---- pre-optimisation comparison ----
-    if args.compare_before:
-        print("rendering pre-optimisation comparison…")
+    if compare_before is not None:
+        print("rendering pre-optimisation comparison ...")
         save_comparison(
             ref_arr, cap_arr, init_params_data,
-            ref_w_full, ref_h_full, Path(args.compare_before).resolve(),
+            ref_w_full, ref_h_full, compare_before,
             args.compare_blend, args.compare_opacity, device, comp_size,
         )
 
@@ -508,8 +523,8 @@ def main() -> int:
     best_params = params.data.clone()
     loss_val = initial_loss       # fallback if --iters 0
 
-    # ---- main loop ----
-    print("optimising…")
+    # ---- main optimisation loop ----
+    print("optimising ...")
     for i in range(args.iters):
         if args.optimizer == "lbfgs":
             def closure():
@@ -545,12 +560,7 @@ def main() -> int:
 
     print(f"final loss: {loss_val:.6f}  (best: {best_loss:.6f})")
 
-    # ---- output ----
-    out_json = (
-        Path(args.output).resolve()
-        if args.output
-        else Path.cwd() / f"{cap_path.stem}.align.opt.json"
-    )
+    # ---- save output JSON ----
     result = build_output(
         ref_path=ref_path, cap_path=cap_path,
         ref_w=ref_w_full, ref_h=ref_h_full,
@@ -579,15 +589,191 @@ def main() -> int:
               f"   ({dx:+7.2f},{dy:+7.2f})")
 
     # ---- post-optimisation comparison ----
-    if args.compare_after:
-        print("rendering post-optimisation comparison…")
+    if compare_after is not None:
+        print("rendering post-optimisation comparison ...")
         save_comparison(
             ref_arr, cap_arr, best_cpu,
-            ref_w_full, ref_h_full, Path(args.compare_after).resolve(),
+            ref_w_full, ref_h_full, compare_after,
             args.compare_blend, args.compare_opacity, device, comp_size,
         )
 
     return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Gradient-based fine-tuning of a quad alignment.\n\n"
+            "When --reference and --captured are both directories the script\n"
+            "processes every matching (captured, reference) pair.  Each captured\n"
+            "image must follow the naming convention:\n"
+            "  cap-XXXX-YYY_<ref-stem>.<ext>\n"
+            "The part after the last '_' (without extension) is used to locate\n"
+            "the matching reference file(s) inside --reference.  --output must\n"
+            "then also be a directory.  --input-json may still be a single file."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--reference",  required=True,
+                   help="reference image path or directory of reference images")
+    p.add_argument("--captured",   required=True,
+                   help="recaptured image path or directory of captured images")
+    p.add_argument("--input-json", required=True,
+                   help="alignment JSON produced by align_quad.py (mandatory)")
+    p.add_argument("--loss", default="ms-ssim", metavar="FUNC",
+                   help="loss function: ms-ssim or dists")
+    p.add_argument("--greyscale", action="store_true",
+                   help="convert both images to greyscale before loss")
+    p.add_argument("--iters", type=int, default=300,
+                   help="number of optimisation steps")
+    p.add_argument("--lr", type=float, default=None,
+                   help="learning rate (default 0.005 for adam, 0.5 for lbfgs)")
+    p.add_argument("--optimizer", choices=("adam", "lbfgs"), default="adam")
+    p.add_argument("--max-size", type=int, default=512,
+                   help="longest edge of the working resolution for loss computation")
+    p.add_argument("--output", default=None,
+                   help="output JSON path (single-image mode) or output directory "
+                        "(directory mode).  Default: <captured_stem>.align.opt.json "
+                        "in the current directory.")
+    p.add_argument("--report-every", type=int, default=50,
+                   help="print loss every N iterations")
+    p.add_argument("--device", default=None,
+                   help="torch device (default: cuda if available, else cpu)")
+    g = p.add_argument_group("comparison output")
+    g.add_argument("--compare-before", default=None, metavar="PATH",
+                   help="save pre-optimisation comparison image to this path "
+                        "(directory in batch mode)")
+    g.add_argument("--compare-after", default=None, metavar="PATH",
+                   help="save post-optimisation comparison image to this path "
+                        "(directory in batch mode)")
+    g.add_argument("--compare-blend", nargs="+", default=["normal"],
+                   choices=["normal", "gcap"], metavar="MODE",
+                   help="blend mode(s) for comparison: normal gcap (default: normal)")
+    g.add_argument("--compare-opacity", type=float, default=0.5,
+                   help="overlay opacity for normal blend (default: 0.5)")
+    g.add_argument("--compare-size", type=int, default=0,
+                   help="max resolution of comparison images in pixels "
+                        "(default: full reference resolution)")
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    args = parse_args()
+
+    ref_input  = Path(args.reference).resolve()
+    cap_input  = Path(args.captured).resolve()
+    json_path  = Path(args.input_json).resolve()
+
+    if not json_path.is_file():
+        print(f"error: file not found: {json_path}", file=sys.stderr)
+        return 2
+    json_data = json.loads(json_path.read_text(encoding="utf-8"))
+
+    # ---- device ----
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+
+    # ---- loss ----
+    try:
+        loss_name, loss_fn = build_loss(args.loss)  # type: ignore[assignment]
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    loss_fn = loss_fn.to(device)
+    print(f"loss:   {loss_name}")
+
+    # ---- single-image mode ----
+    if ref_input.is_file() and cap_input.is_file():
+        out_json = (
+            Path(args.output).resolve()
+            if args.output
+            else Path.cwd() / f"{cap_input.stem}.align.opt.json"
+        )
+        compare_before = Path(args.compare_before).resolve() if args.compare_before else None
+        compare_after  = Path(args.compare_after).resolve()  if args.compare_after  else None
+        return process_pair(
+            ref_path=ref_input,
+            cap_path=cap_input,
+            json_data=json_data,
+            args=args,
+            device=device,
+            loss_name=loss_name,
+            loss_fn=loss_fn,
+            out_json=out_json,
+            compare_before=compare_before,
+            compare_after=compare_after,
+        )
+
+    # ---- directory mode ----
+    if not ref_input.is_dir():
+        print(f"error: not a file or directory: {ref_input}", file=sys.stderr)
+        return 2
+    if not cap_input.is_dir():
+        print(f"error: not a file or directory: {cap_input}", file=sys.stderr)
+        return 2
+
+    out_dir = Path(args.output).resolve() if args.output else Path.cwd()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmp_before_dir = Path(args.compare_before).resolve() if args.compare_before else None
+    cmp_after_dir  = Path(args.compare_after).resolve()  if args.compare_after  else None
+    if cmp_before_dir:
+        cmp_before_dir.mkdir(parents=True, exist_ok=True)
+    if cmp_after_dir:
+        cmp_after_dir.mkdir(parents=True, exist_ok=True)
+
+    pairs = _build_pairs(ref_input, cap_input)
+    if not pairs:
+        print("error: no matching image pairs found", file=sys.stderr)
+        return 2
+
+    print(f"\nfound {len(pairs)} pair(s) to process")
+
+    # When a single captured image maps to multiple reference files we need to
+    # disambiguate the output names with the reference file extension.
+    from collections import Counter
+    cap_counts = Counter(cap for _, cap in pairs)
+
+    errors = 0
+    for ref_path, cap_path in pairs:
+        if cap_counts[cap_path] > 1:
+            out_stem = f"{cap_path.stem}_{ref_path.suffix.lstrip('.')}"
+        else:
+            out_stem = cap_path.stem
+        out_json = out_dir / f"{out_stem}.align.opt.json"
+
+        cmp_before = (cmp_before_dir / f"{out_stem}.png") if cmp_before_dir else None
+        cmp_after  = (cmp_after_dir  / f"{out_stem}.png") if cmp_after_dir  else None
+
+        rc = process_pair(
+            ref_path=ref_path,
+            cap_path=cap_path,
+            json_data=json_data,
+            args=args,
+            device=device,
+            loss_name=loss_name,
+            loss_fn=loss_fn,
+            out_json=out_json,
+            compare_before=cmp_before,
+            compare_after=cmp_after,
+        )
+        if rc != 0:
+            errors += 1
+
+    print(f"\n{'='*60}")
+    print(f"done: {len(pairs) - errors}/{len(pairs)} pairs succeeded")
+    return 0 if errors == 0 else 1
 
 
 if __name__ == "__main__":
